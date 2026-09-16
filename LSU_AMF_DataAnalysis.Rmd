@@ -1364,54 +1364,121 @@ cat("Samples with AMF reads:", nsamples(ps_amf), "of", nsamples(ps_amf_all), "\n
 if (length(zero_amf_samples) > 0) print(zero_amf_samples)
 ```
 
-# 7. Sequencing-depth and coverage diagnostics
+# 7. AMF detection and sequencing-depth diagnostics
 
 ```{r depth-coverage}
-amf_matrix <- as(otu_table(ps_amf), "matrix")
-if (taxa_are_rows(ps_amf)) amf_matrix <- t(amf_matrix)
+amf_matrix_all <- as(otu_table(ps_amf_all), "matrix")
+if (taxa_are_rows(ps_amf_all)) amf_matrix_all <- t(amf_matrix_all)
 
-goods_coverage <- apply(amf_matrix, 1, function(x) {
-  if (sum(x) == 0) return(NA_real_)
-  1 - sum(x == 1) / sum(x)
-})
+if (!setequal(rownames(amf_matrix_all), rownames(seqtab_ids))) {
+  stop("AMF object and original LSU count table contain different samples.")
+}
 
-depth_df <- data.frame(sample_data(ps_amf)) %>%
+total_lsu_reads <- rowSums(seqtab_ids)
+amf_reads <- rowSums(amf_matrix_all)
+amf_asvs <- rowSums(amf_matrix_all > 0)
+
+depth_df <- data.frame(sample_data(ps_amf_all)) %>%
   rownames_to_column("SampleID_join") %>%
   mutate(
-    AMF_reads = sample_sums(ps_amf)[SampleID_join],
-    Observed_ASVs = rowSums(amf_matrix > 0)[SampleID_join],
-    Goods_coverage = goods_coverage[SampleID_join]
+    Total_LSU_reads = unname(total_lsu_reads[SampleID_join]),
+    AMF_reads = unname(amf_reads[SampleID_join]),
+    AMF_read_fraction = if_else(
+      Total_LSU_reads > 0, AMF_reads / Total_LSU_reads, NA_real_
+    ),
+    Observed_ASVs = unname(amf_asvs[SampleID_join]),
+    AMF_detected = AMF_reads > 0,
+    Compartment = factor(Compartment, levels = part_order)
   )
 
-write.csv(depth_df, file.path(table_dir, "AMF_sample_depth_and_coverage.csv"), row.names = FALSE)
+if (nrow(depth_df) != nrow(seqtab_ids) || anyNA(depth_df$AMF_reads)) {
+  stop("AMF depth table could not be matched to every LSU sample.")
+}
 
-p_depth <- ggplot(depth_df, aes(Compartment, AMF_reads, color = Host_species)) +
-  geom_hline(yintercept = 1, color = "grey75") +
-  geom_jitter(width = 0.14, height = 0, size = 2.5, alpha = 0.85) +
-  scale_y_log10(labels = scales::comma) +
-  labs(x = "Compartment or organ", y = "Phylogenetically validated AMF reads",
-       color = "Host genus", title = "AMF library size") +
+write.csv(depth_df, file.path(table_dir, "AMF_sample_detection_and_depth.csv"),
+          row.names = FALSE)
+
+group_detection <- depth_df %>%
+  group_by(Host_species, Compartment, Ecosite) %>%
+  summarise(
+    n_samples = n(),
+    n_AMF_detected = sum(AMF_detected),
+    detection_fraction = n_AMF_detected / n_samples,
+    total_AMF_reads = sum(AMF_reads),
+    median_AMF_reads = median(AMF_reads),
+    median_AMF_read_fraction = median(AMF_read_fraction, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(group_detection,
+          file.path(table_dir, "AMF_detection_by_host_compartment.csv"),
+          row.names = FALSE)
+
+cat(
+  sum(depth_df$AMF_detected), "of", nrow(depth_df),
+  "samples had at least one validated AMF read.\n"
+)
+cat(
+  sum(depth_df$AMF_reads), "validated AMF reads among",
+  sum(depth_df$Total_LSU_reads), "non-chimeric LSU reads.\n"
+)
+
+detected_colors <- c(`FALSE` = "grey55", `TRUE` = "#007F73")
+
+p_depth <- ggplot(depth_df, aes(Compartment, AMF_reads, color = AMF_detected)) +
+  geom_jitter(width = 0.13, height = 0, size = 2.5, alpha = 0.85) +
+  facet_wrap(~ Host_species, scales = "free_x", ncol = 3) +
+  scale_color_manual(values = detected_colors,
+                     labels = c(`FALSE` = "Not detected", `TRUE` = "Detected")) +
+  scale_y_continuous(
+    trans = "log1p",
+    breaks = c(0, 2, 5, 10, 25, 50, 100, 250, 500),
+    labels = scales::comma
+  ) +
+  labs(x = "Compartment or organ", y = "Validated AMF reads (log1p scale)",
+       color = "AMF", title = "AMF read counts across all LSU samples") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-p_cov <- ggplot(depth_df, aes(Compartment, Goods_coverage, color = Host_species)) +
-  geom_hline(yintercept = TARGET_COVERAGE, linetype = "dashed") +
-  geom_jitter(width = 0.14, height = 0, size = 2.5, alpha = 0.85) +
-  coord_cartesian(ylim = c(0, 1)) +
-  labs(x = "Compartment or organ", y = "Good's coverage",
-       color = "Host genus", title = "Per-sample sampling coverage") +
+p_fraction <- ggplot(
+  depth_df, aes(Compartment, AMF_read_fraction, color = AMF_detected)
+) +
+  geom_jitter(width = 0.13, height = 0, size = 2.5, alpha = 0.85) +
+  facet_wrap(~ Host_species, scales = "free_x", ncol = 3) +
+  scale_color_manual(values = detected_colors,
+                     labels = c(`FALSE` = "Not detected", `TRUE` = "Detected")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(x = "Compartment or organ",
+       y = "AMF reads / all non-chimeric LSU reads",
+       color = "AMF", title = "AMF read fraction across all LSU samples") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-p_depth + p_cov
-ggsave(file.path(fig_dir, "AMF_depth_and_coverage.pdf"),
-       p_depth + p_cov, width = 13, height = 5.5)
+p_detection <- p_depth / p_fraction +
+  patchwork::plot_annotation(
+    caption = paste(
+      "Each point is one independent sample, including zero detections.",
+      "Read fraction is not organism abundance or colonization."
+    )
+  )
+
+p_detection
+ggsave(file.path(fig_dir, "AMF_detection_and_depth_all_samples.pdf"),
+       p_detection, width = 15, height = 11)
 ```
 
-Good's coverage is a diagnostic, not a substitute for coverage-based diversity
-estimation. Samples with low AMF read counts or coverage should be reported and
-examined in sensitivity analyses instead of being removed with an unexplained
-10,000- or 15,000-read cutoff.
+The previous Good's-coverage panel is removed: no cell of the processed AMF
+count table has exactly one read, so its singleton-based estimator is exactly 1
+for every positive sample. This does not establish that AMF diversity is well
+sampled. Zero AMF reads mean **not detected by this assay**, not biological
+absence. The read fraction is relative to all non-chimeric LSU reads, not an
+absolute abundance or colonization measure.
 
 # 8. Taxonomic composition
+
+The plots in this section answer a different question from section 7: among
+samples with detectable AMF, how are **AMF reads** distributed among families?
+The denominator for a stacked bar is the validated AMF reads in that sample,
+not all fungal LSU reads. The read count printed under each bar is essential
+context because a 100% bar can represent only a few reads.
 
 ```{r family-composition}
 tax_clean <- as(tax_table(ps_amf), "matrix")
@@ -1425,8 +1492,31 @@ tax_table(ps_amf) <- tax_table(tax_clean)
 ps_family <- tax_glom(ps_amf, taxrank = "Family", NArm = FALSE)
 ps_family_rel <- transform_sample_counts(ps_family, function(x) x / sum(x))
 
+# Include zero-AMF samples for prevalence, but never divide their counts by zero
+# when calculating family composition conditional on AMF detection.
+tax_clean_all <- as(tax_table(ps_amf_all), "matrix")
+tax_clean_all[, "Family"] <- ifelse(
+  is.na(tax_clean_all[, "Family"]) | tax_clean_all[, "Family"] == "",
+  "Unclassified_Glomeromycota",
+  tax_clean_all[, "Family"]
+)
+tax_table(ps_amf_all) <- tax_table(tax_clean_all)
+ps_family_all <- tax_glom(ps_amf_all, taxrank = "Family", NArm = FALSE)
+
 family_totals <- sort(taxa_sums(ps_family_rel), decreasing = TRUE)
 top_families <- names(family_totals[family_totals / sum(family_totals) >= 0.01])
+
+sample_plot_order <- depth_df %>%
+  filter(AMF_detected) %>%
+  arrange(Host_species, Compartment, Plant_replicate, SampleID_join) %>%
+  transmute(
+    Sample = SampleID_join,
+    Sample_label = paste0(
+      as.character(Compartment), "-", Plant_replicate,
+      "\n", AMF_reads, " reads"
+    )
+  )
+sample_labels <- setNames(sample_plot_order$Sample_label, sample_plot_order$Sample)
 
 composition_df <- psmelt(ps_family_rel) %>%
   mutate(
@@ -1434,33 +1524,42 @@ composition_df <- psmelt(ps_family_rel) %>%
     Compartment = factor(Compartment, levels = part_order)
   ) %>%
   group_by(Sample, Host_species, Compartment, Family_plot) %>%
-  summarise(Abundance = sum(Abundance), .groups = "drop")
+  summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+  mutate(Sample_plot = factor(Sample, levels = sample_plot_order$Sample))
 
 p_composition <- ggplot(
   composition_df,
-  aes(Sample, Abundance, fill = Family_plot)
+  aes(Sample_plot, Abundance, fill = Family_plot)
 ) +
-  geom_col(width = 0.95) +
-  facet_grid(Host_species ~ Compartment, scales = "free_x", space = "free_x") +
+  geom_col(width = 0.9) +
+  facet_wrap(~ Host_species, scales = "free_x", ncol = 2) +
+  scale_x_discrete(labels = function(x) unname(sample_labels[x])) +
   scale_y_continuous(labels = scales::percent) +
-  labs(x = NULL, y = "Relative abundance", fill = "AMF family",
-       title = "AMF family composition by biological sample") +
+  labs(x = "Compartment-replicate and validated AMF read count",
+       y = "Share of validated AMF reads", fill = "AMF family",
+       title = "AMF family composition among AMF-positive samples",
+       caption = paste(
+         "Each bar sums to 100% of that sample's validated AMF reads.",
+         "Zero-AMF samples are shown in the detection figure, not here."
+       )) +
   theme(
-    axis.text.x = element_blank(), axis.ticks.x = element_blank(),
-    strip.text.y = element_text(angle = 0)
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    panel.grid.major.x = element_blank()
   )
 
 p_composition
-ggsave(file.path(fig_dir, "AMF_family_composition_samples.pdf"),
-       p_composition, width = 14, height = 8)
+ggsave(file.path(fig_dir, "AMF_family_composition_positive_samples.pdf"),
+       p_composition, width = 16, height = 11)
 ```
 
 ```{r prevalence-abundance}
-family_counts_long <- psmelt(ps_family) %>%
+family_counts_long <- psmelt(ps_family_all) %>%
   mutate(Compartment = factor(Compartment, levels = part_order)) %>%
   group_by(Host_species, Compartment, Family) %>%
   summarise(
-    Prevalence = mean(Abundance > 0),
+    n_samples = n(),
+    n_family_detected = sum(Abundance > 0),
+    Prevalence = n_family_detected / n_samples,
     Mean_reads = mean(Abundance),
     .groups = "drop"
   )
@@ -1468,41 +1567,378 @@ family_counts_long <- psmelt(ps_family) %>%
 family_rel_long <- psmelt(ps_family_rel) %>%
   mutate(Compartment = factor(Compartment, levels = part_order)) %>%
   group_by(Host_species, Compartment, Family) %>%
-  summarise(Mean_relative_abundance = mean(Abundance), .groups = "drop")
+  summarise(
+    n_AMF_positive = n(),
+    Mean_relative_abundance_positive = mean(Abundance),
+    .groups = "drop"
+  )
 
 family_summary <- left_join(
   family_counts_long, family_rel_long,
   by = c("Host_species", "Compartment", "Family")
 ) %>%
-  mutate(Group = paste(Host_species, Compartment, sep = " | "))
+  mutate(n_AMF_positive = replace_na(n_AMF_positive, 0L)) %>%
+  left_join(
+    group_detection %>%
+      select(Host_species, Compartment, n_AMF_detected),
+    by = c("Host_species", "Compartment")
+  ) %>%
+  mutate(
+    Group = paste0(
+      Host_species, " | ", Compartment, "\n(",
+      n_AMF_detected, "/", n_samples, " AMF+)"
+    )
+  )
+
+group_levels <- family_summary %>%
+  distinct(Host_species, Compartment, Group) %>%
+  arrange(Host_species, Compartment) %>%
+  pull(Group)
+family_summary$Group <- factor(family_summary$Group, levels = group_levels)
 
 write.csv(family_summary, file.path(table_dir, "AMF_family_prevalence_abundance.csv"),
           row.names = FALSE)
 
 p_bubble <- ggplot(
-  family_summary,
-  aes(Group, Family, size = Prevalence, color = Mean_relative_abundance)
+  family_summary %>% filter(n_family_detected > 0),
+  aes(Group, Family, size = Prevalence,
+      color = Mean_relative_abundance_positive)
 ) +
   geom_point(alpha = 0.9) +
+  scale_x_discrete(drop = FALSE) +
   scale_size(range = c(1, 8), labels = scales::percent) +
   scale_color_viridis_c(labels = scales::percent, trans = "sqrt") +
-  labs(x = NULL, y = NULL, size = "Prevalence",
-       color = "Mean relative\nabundance",
-       title = "AMF family prevalence and abundance") +
+  labs(x = "Host and compartment (AMF-positive / all samples)", y = NULL,
+       size = "Family prevalence\namong all samples",
+       color = "Mean share among\nAMF-positive samples",
+       title = "AMF family detection and conditional composition",
+       caption = paste(
+         "Dot size includes zero-AMF samples in the prevalence denominator.",
+         "Dot color averages family share only among AMF-positive samples;",
+         "no dot means the family was not detected."
+       )) +
   theme(axis.text.x = element_text(angle = 55, hjust = 1))
 
 p_bubble
 ggsave(file.path(fig_dir, "AMF_family_prevalence_bubble.pdf"),
-       p_bubble, width = 14, height = 7)
+       p_bubble, width = 17, height = 8)
 ```
 
-# 9. Alpha diversity
+The V18 category `Sclerocystaceae_Kamienskiaceae` is an unresolved combined
+clade label and must not be reported as a single named family. Family-level
+patterns in low-read libraries remain descriptive, especially because the LSU
+library had no negative controls.
 
-AMF rDNA can show intragenomic variation, so ASV richness is not interpreted as
-a literal species count. The preferred alpha-diversity panel uses Hill numbers
-standardized to equal sample coverage. Install `iNEXT` to run this section.
+# 9. Low-depth-aware quantitative analysis
 
-```{r coverage-based-alpha}
+This section continues the analysis without choosing a post hoc minimum AMF
+read count. It uses all 65 samples for **detection** and all 45 AMF-positive
+samples for **conditional composition**. Those are distinct questions. Zero
+reads mean not detected by this assay; they do not establish AMF absence.
+No LSU negative or positive controls or replicate PCRs were available.
+
+## 9.1 Descriptive alpha-diversity audit
+
+Observed ASVs and families are unstandardized counts of detected sequence
+features, not species richness. Shannon diversity is likewise sensitive to
+AMF read depth at these library sizes. These values are exported for audit and
+description only; no alpha-diversity hypothesis tests are run.
+
+```{r alpha-descriptive}
+family_counts_all <- as(otu_table(ps_family_all), "matrix")
+if (taxa_are_rows(ps_family_all)) family_counts_all <- t(family_counts_all)
+
+if (!setequal(rownames(family_counts_all), depth_df$SampleID_join)) {
+  stop("Family count table and detection table contain different samples.")
+}
+
+family_counts_all <- family_counts_all[depth_df$SampleID_join, , drop = FALSE]
+family_shannon <- vegan::diversity(family_counts_all, index = "shannon")
+
+alpha_audit <- depth_df %>%
+  mutate(
+    Observed_AMF_families = rowSums(family_counts_all > 0),
+    Shannon_AMF_families = if_else(
+      AMF_detected, unname(family_shannon), NA_real_
+    )
+  ) %>%
+  select(
+    SampleID_join, Host_species, Compartment, Ecosite,
+    Total_LSU_reads, AMF_reads, AMF_read_fraction, AMF_detected,
+    Observed_ASVs, Observed_AMF_families, Shannon_AMF_families
+  )
+
+alpha_group_summary <- alpha_audit %>%
+  group_by(Host_species, Compartment) %>%
+  summarise(
+    n_collected = n(),
+    n_AMF_detected = sum(AMF_detected),
+    median_AMF_reads_all = median(AMF_reads),
+    median_ASVs_positive = if (any(AMF_detected)) {
+      median(Observed_ASVs[AMF_detected])
+    } else NA_real_,
+    median_families_positive = if (any(AMF_detected)) {
+      median(Observed_AMF_families[AMF_detected])
+    } else NA_real_,
+    .groups = "drop"
+  )
+
+write.csv(alpha_audit, file.path(table_dir, "AMF_alpha_descriptive_samples.csv"),
+          row.names = FALSE)
+write.csv(alpha_group_summary,
+          file.path(table_dir, "AMF_alpha_descriptive_groups.csv"),
+          row.names = FALSE)
+
+knitr::kable(alpha_group_summary, digits = 2)
+```
+
+## 9.2 Host-stratified AMF detection contrasts
+
+BR-versus-BS and Rh-versus-root are the only across-host contrasts for which
+both compartments were sampled within each included host. Samples are
+independent, not paired. For each host, the effect is the difference in the
+fraction of samples with at least one validated AMF read. The pooled estimate
+is the **equal-host-weighted** mean of those differences, so a host with one
+extra sample does not dominate. The two-sided P-value is obtained from the
+exact conditional distribution of detections under within-host exchangeability,
+then Holm-adjusted for these two planned contrasts. These are tests of
+*assay detection*, not of colonization or biological absence. With only 2-3
+samples per cell, interpret effect sizes and cell counts ahead of P-values.
+
+```{r detection-contrasts}
+exact_stratified_detection <- function(data, part_A, part_B, hosts) {
+  dat <- data %>%
+    filter(Host_species %in% hosts,
+           as.character(Compartment) %in% c(part_A, part_B)) %>%
+    mutate(Compartment = as.character(Compartment))
+
+  by_host <- dat %>%
+    group_by(Host_species) %>%
+    summarise(
+      n_A = sum(Compartment == part_A),
+      detected_A = sum(AMF_detected & Compartment == part_A),
+      n_B = sum(Compartment == part_B),
+      detected_B = sum(AMF_detected & Compartment == part_B),
+      .groups = "drop"
+    ) %>%
+    arrange(Host_species)
+
+  if (nrow(by_host) != length(hosts) ||
+      any(by_host$n_A == 0 | by_host$n_B == 0)) {
+    stop("Missing a host-compartment cell in detection contrast.")
+  }
+
+  by_host <- by_host %>%
+    mutate(detection_difference = detected_A / n_A - detected_B / n_B)
+  observed <- mean(by_host$detection_difference)
+
+  support <- lapply(seq_len(nrow(by_host)), function(i) {
+    z <- by_host[i, ]
+    successes <- z$detected_A + z$detected_B
+    failures <- z$n_A + z$n_B - successes
+    x <- seq(max(0, z$n_A - failures), min(successes, z$n_A))
+    list(
+      difference = x / z$n_A - (successes - x) / z$n_B,
+      probability = stats::dhyper(x, successes, failures, z$n_A)
+    )
+  })
+
+  grid <- expand.grid(lapply(support, function(x) seq_along(x$difference)),
+                      KEEP.OUT.ATTRS = FALSE)
+  null_effect <- numeric(nrow(grid))
+  null_probability <- rep(1, nrow(grid))
+  for (i in seq_along(support)) {
+    null_effect <- null_effect +
+      support[[i]]$difference[grid[[i]]] / length(support)
+    null_probability <- null_probability *
+      support[[i]]$probability[grid[[i]]]
+  }
+
+  p_exact <- sum(null_probability[
+    abs(null_effect) >= abs(observed) - 1e-12
+  ])
+
+  list(
+    summary = tibble(
+      contrast = paste(part_A, "vs", part_B),
+      n_hosts = nrow(by_host),
+      n_samples = sum(by_host$n_A + by_host$n_B),
+      mean_detection_difference_A_minus_B = observed,
+      p_exact_two_sided = min(1, p_exact)
+    ),
+    by_host = by_host %>% mutate(contrast = paste(part_A, "vs", part_B))
+  )
+}
+
+soil_detection <- exact_stratified_detection(
+  depth_df, "BR", "BS",
+  c("Chusquea", "Espeletia", "Oritrophium", "Racomitrium")
+)
+root_detection <- exact_stratified_detection(
+  depth_df, "Rh", "root",
+  c("Calamagrostis", "Chusquea", "Oreobolus")
+)
+
+detection_contrasts <- bind_rows(
+  soil_detection$summary, root_detection$summary
+) %>%
+  mutate(p_Holm = p.adjust(p_exact_two_sided, method = "holm"))
+detection_by_host <- bind_rows(
+  soil_detection$by_host, root_detection$by_host
+)
+
+write.csv(detection_contrasts,
+          file.path(table_dir, "AMF_detection_exact_contrasts.csv"),
+          row.names = FALSE)
+write.csv(detection_by_host,
+          file.path(table_dir, "AMF_detection_contrasts_by_host.csv"),
+          row.names = FALSE)
+
+knitr::kable(detection_contrasts, digits = 3)
+knitr::kable(detection_by_host, digits = 3)
+```
+
+## 9.3 Family-level beta diversity among AMF-positive samples
+
+Bray-Curtis distances are calculated from family proportions with **no ASV
+prevalence/read-count filter**; every AMF-positive sample therefore remains in
+the descriptive ordination. A zero-AMF sample has no defined within-AMF family
+composition and is not assigned a distance. The first two coordinates and
+metadata are exported now; the paper figure can be designed later. Distances
+from samples with only a few AMF reads are especially uncertain.
+
+The only exploratory composition test is BR-versus-BS across the four hosts
+with both compartments and at least two AMF-positive samples per cell. It uses
+an additive host + compartment model, with permutations restricted within host.
+The square root of Bray-Curtis distance is used for this test and PERMDISP so
+the dispersion calculation does not have to truncate negative squared
+distances. PERMDISP is reported alongside PERMANOVA because dispersion can
+contribute to an apparent difference. No Rh-versus-root or within-host
+composition test is run: positive root samples are absent or too sparse for
+those comparisons.
+
+```{r family-beta-exploratory}
+family_counts_positive <- family_counts_all[
+  depth_df$SampleID_join[depth_df$AMF_detected], , drop = FALSE
+]
+if (any(rowSums(family_counts_positive) == 0)) {
+  stop("An AMF-positive sample has no counts after family aggregation.")
+}
+
+family_rel_positive <- sweep(
+  family_counts_positive, 1, rowSums(family_counts_positive), "/"
+)
+family_bray <- vegan::vegdist(family_rel_positive, method = "bray")
+
+meta_positive <- depth_df[
+  match(rownames(family_rel_positive), depth_df$SampleID_join), ,
+  drop = FALSE
+]
+rownames(meta_positive) <- meta_positive$SampleID_join
+if (anyNA(meta_positive$SampleID_join)) stop("Beta metadata matching failed.")
+
+family_pcoa <- stats::cmdscale(family_bray, k = 2, eig = TRUE, add = TRUE)
+family_pcoa_scores <- as.data.frame(family_pcoa$points) %>%
+  setNames(c("PCoA1", "PCoA2")) %>%
+  rownames_to_column("SampleID_join") %>%
+  left_join(
+    meta_positive %>%
+      select(SampleID_join, Host_species, Compartment, Ecosite, AMF_reads),
+    by = "SampleID_join"
+  )
+
+write.csv(family_pcoa_scores,
+          file.path(table_dir, "AMF_family_PCoA_scores_positive_samples.csv"),
+          row.names = FALSE)
+
+soil_hosts <- c("Chusquea", "Espeletia", "Oritrophium", "Racomitrium")
+soil_meta <- meta_positive %>%
+  filter(Host_species %in% soil_hosts,
+         as.character(Compartment) %in% c("BR", "BS")) %>%
+  mutate(
+    Host_species = factor(as.character(Host_species), levels = soil_hosts),
+    Compartment = factor(as.character(Compartment), levels = c("BR", "BS"))
+  )
+rownames(soil_meta) <- soil_meta$SampleID_join
+soil_cell_n <- table(soil_meta$Host_species, soil_meta$Compartment)
+if (any(soil_cell_n < 2)) {
+  stop("BR/BS family-composition test requires at least two positive samples per cell.")
+}
+
+soil_rel <- family_rel_positive[soil_meta$SampleID_join, , drop = FALSE]
+soil_bray <- vegan::vegdist(soil_rel, method = "bray")
+soil_permutations <- permute::how(
+  nperm = 9999, blocks = soil_meta$Host_species
+)
+set.seed(42)
+soil_permanova <- vegan::adonis2(
+  soil_bray ~ Host_species + Compartment,
+  data = soil_meta,
+  permutations = soil_permutations,
+  sqrt.dist = TRUE,
+  by = "margin"
+)
+
+soil_dispersion <- vegan::betadisper(
+  soil_bray, group = soil_meta$Compartment, sqrt.dist = TRUE
+)
+set.seed(42)
+soil_permdisp <- vegan::permutest(
+  soil_dispersion, permutations = soil_permutations
+)
+
+soil_beta_summary <- tibble(
+  comparison = "BR vs BS among AMF-positive samples",
+  level = "V18 family clades; sqrt(Bray-Curtis)",
+  n_samples = nrow(soil_meta),
+  n_hosts = nlevels(soil_meta$Host_species),
+  min_AMF_reads = min(soil_meta$AMF_reads),
+  median_AMF_reads = median(soil_meta$AMF_reads),
+  R2_compartment = soil_permanova["Compartment", "R2"],
+  F_compartment = soil_permanova["Compartment", "F"],
+  p_PERMANOVA = soil_permanova["Compartment", "Pr(>F)"],
+  p_PERMDISP = soil_permdisp$tab[1, "Pr(>F)"]
+)
+
+write.csv(soil_beta_summary,
+          file.path(table_dir, "AMF_family_BR_BS_exploratory_test.csv"),
+          row.names = FALSE)
+capture.output(soil_permanova,
+               file = file.path(table_dir, "AMF_family_BR_BS_PERMANOVA_full.txt"))
+capture.output(soil_permdisp,
+               file = file.path(table_dir, "AMF_family_BR_BS_PERMDISP_full.txt"))
+
+knitr::kable(soil_beta_summary, digits = 3)
+```
+
+The BR-versus-BS test is exploratory and conditional on AMF detection. It is
+not evidence that BR and BS are biologically equivalent if nonsignificant, and
+it does not establish a causal host, ecosite, or colonization effect. The host
+term is a nuisance adjustment: its P-value in the full PERMANOVA output is not
+interpretable because permutations were restricted within host. Only the
+`Compartment` row is reported in the summary table.
+
+# Appendix: earlier analysis drafts, disabled
+
+The following chunks are retained for provenance but should not be run with the
+current low-depth LSU data. The active quantitative analysis is section 9 above.
+
+## Earlier alpha-diversity draft - paused
+
+The processed AMF table has zero singleton cells, and 20 of 65 samples have no
+validated AMF reads. Therefore the singleton-based coverage estimate is exactly
+1 in every positive sample for a technical reason and must not be used to
+justify equal-coverage standardization. The previous iNEXT analysis is retained
+below only as a record; it is **not run**. AMF ASV richness is not a species count.
+First decide whether alpha-diversity comparisons are defensible at these depths,
+and predefine any sample-level sensitivity rules before enabling the code.
+
+```{r coverage-based-alpha, eval=FALSE}
+amf_matrix <- amf_matrix_all[depth_df$AMF_detected, , drop = FALSE]
+if (sum(amf_matrix == 1) == 0) {
+  stop("Coverage-based alpha analysis is paused: no singleton counts in the processed AMF table.")
+}
+
 alpha_estimates <- NULL
 
 if (requireNamespace("iNEXT", quietly = TRUE)) {
@@ -1555,7 +1991,7 @@ With two or three independent samples per host–compartment cell, formal
 within-host alpha-diversity tests have low power and discrete P-values. Report
 estimates and intervals as primary; treat the following tests as exploratory.
 
-```{r alpha-tests}
+```{r alpha-tests, eval=FALSE}
 alpha_tests <- NULL
 if (!is.null(alpha_estimates)) {
   alpha_tests <- alpha_estimates %>%
@@ -1575,14 +2011,16 @@ if (!is.null(alpha_estimates)) {
 }
 ```
 
-# 10. Beta diversity
+## Earlier beta-diversity draft - paused
 
-Bray–Curtis on proportional counts and Aitchison distance on centered log-ratio
-transformed counts are shown. Neither requires rarefaction. Low-information ASVs
-are filtered only for beta-diversity stability, and the thresholds are recorded
-at the top of the notebook.
+The draft Bray–Curtis and Aitchison ordinations below are **not run**. Filtering
+ASVs at the provisional total-read and prevalence thresholds leaves seven of
+the 45 AMF-positive samples with no retained features, making their distances
+undefined. A revised approach must specify how to handle low-read and
+zero-detection samples before ordination or PERMANOVA is interpreted. No
+rarefaction is used as an automatic remedy.
 
-```{r beta-objects}
+```{r beta-objects, eval=FALSE}
 beta_keep <- taxa_sums(ps_amf) >= MIN_TOTAL_READS_BETA &
   apply(as(otu_table(ps_amf), "matrix"), 1, function(x) sum(x > 0)) >= MIN_PREVALENCE_BETA
 
@@ -1619,7 +2057,7 @@ bray_scores <- pcoa_frame(bray, meta_beta, "Bray–Curtis")
 aitchison_scores <- pcoa_frame(aitchison, meta_beta, "Aitchison")
 ```
 
-```{r beta-plots}
+```{r beta-plots, eval=FALSE}
 plot_pcoa <- function(scores) {
   axis_labels <- attr(scores, "axis_labels")
   distance_label <- attr(scores, "distance_label")
@@ -1640,10 +2078,12 @@ ggsave(file.path(fig_dir, "AMF_PCoA_Bray_Aitchison.pdf"),
        p_bray / p_aitchison, width = 12, height = 13)
 ```
 
-These global ordinations are descriptive because the host × compartment matrix
-contains structural zeros. The primary tests below use only estimable subsets.
+If later enabled, these global ordinations would be descriptive and conditional
+on detecting AMF. They would exclude 20 zero-AMF samples and must not be
+interpreted as representing all collected tissues or as evidence of biological
+absence from omitted samples.
 
-## 10.1 Prespecified, estimable PERMANOVA models
+### Earlier PERMANOVA models - paused
 
 1. BR versus BS among the four host genera having both compartments, adjusted
    for host genus with an additive model.
@@ -1651,15 +2091,22 @@ contains structural zeros. The primary tests below use only estimable subsets.
    for host genus with an additive model.
 3. Within-host compartment tests, with independent samples and no blocking.
 
-All tests are accompanied by PERMDISP. A significant PERMANOVA with significant
-dispersion must not be described simply as a centroid/composition difference.
+These tests are **not run** in the current report. In particular, all
+Calamagrostis root samples and two of three Oreobolus root samples have zero
+validated AMF reads. Dropping them makes the intended across-host Rh-versus-root
+composition comparison unrepresentative. The BR-versus-BS and within-host tests
+also require review of low-read samples and dispersion before inference.
+
+When a future analysis plan is agreed, tests must be accompanied by PERMDISP.
+A significant PERMANOVA with significant dispersion must not be described simply
+as a centroid/composition difference.
 The shared-compartment models are additive because the primary estimand is the
 overall compartment contrast after accounting for host. Host-specific tests
 below are used to examine whether the pattern is consistent among hosts; the
 small cell sizes do not support a reliable omnibus host-by-compartment
 interaction test.
 
-```{r permanova-functions}
+```{r permanova-functions, eval=FALSE}
 subset_beta_data <- function(sample_ids) {
   x <- beta_rel[sample_ids, , drop = FALSE]
   x <- x[, colSums(x) > 0, drop = FALSE]
@@ -1684,7 +2131,7 @@ run_design_test <- function(label, sample_ids, formula_rhs, dispersion_group) {
 }
 ```
 
-```{r permanova-primary}
+```{r permanova-primary, eval=FALSE}
 soil_hosts <- c("Espeletia", "Chusquea", "Oritrophium", "Racomitrium")
 soil_ids <- rownames(meta_beta)[
   meta_beta$Host_species %in% soil_hosts & meta_beta$Compartment %in% c("BR", "BS")
@@ -1720,7 +2167,7 @@ capture.output(test_root_rh$dispersion,
                file = file.path(table_dir, "PERMDISP_Rh_vs_root.txt"))
 ```
 
-```{r permanova-within-host}
+```{r permanova-within-host, eval=FALSE}
 within_host_tests <- lapply(levels(meta_beta$Host_species), function(host) {
   ids <- rownames(meta_beta)[meta_beta$Host_species == host]
   md <- droplevels(meta_beta[ids, , drop = FALSE])
@@ -1766,9 +2213,9 @@ write.csv(within_host_tests, file.path(table_dir, "PERMANOVA_within_host.csv"),
           row.names = FALSE)
 ```
 
-## 10.2 Pairwise within-host contrasts
+### Earlier pairwise within-host contrasts - paused
 
-```{r pairwise-permanova}
+```{r pairwise-permanova, eval=FALSE}
 pairwise_permanova <- function(host) {
   ids_host <- rownames(meta_beta)[meta_beta$Host_species == host]
   groups <- droplevels(meta_beta[ids_host, "Compartment"])
@@ -1809,15 +2256,14 @@ write.csv(pairwise_results,
 pairwise_results
 ```
 
-# 11. Differential abundance
+## Earlier differential-abundance draft - paused
 
-Differential abundance is restricted to the same two balanced/shared comparisons
-used above. Family-level aggregation is primary because phylogenetic family calls
-are more defensible than interpreting thousands of AMF rDNA ASVs as species.
-ANCOM-BC2 is optional because it is computationally intensive and should be run
-only after reviewing the validated AMF depth/coverage diagnostics.
+Do not enable ANCOM-BC2 with the current zero-AMF and very-low-read pattern.
+Family-level aggregation is more defensible than interpreting AMF rDNA ASVs as
+species, but the comparison set, denominator, and detection process must first
+be reconsidered. The code is retained as a draft only.
 
-```{r ancombc2, eval=RUN_ANCOMBC2}
+```{r ancombc2, eval=FALSE}
 if (!requireNamespace("ANCOMBC", quietly = TRUE)) {
   stop("Install ANCOMBC before setting run_ancombc2: true.")
 }
@@ -1867,12 +2313,13 @@ ancom_root_rh <- run_ancom_shared(
 )
 ```
 
-# 12. Sensitivity analysis: ASVs versus 97% clusters
+# 10. Optional future sensitivity analysis: ASVs versus 97% clusters
 
 AMF can contain biologically real intragenomic LSU variants. Main community
 composition is therefore reported at family/genus level, and richness claims must
 be cautious. For a sensitivity analysis, cluster the validated AMF ASV sequences
-at 97% identity with VSEARCH, sum counts by cluster, and repeat sections 7–10.
+at 97% identity with VSEARCH, sum counts by cluster, and compare descriptive
+feature counts and family composition with the main analysis.
 Do not call 97% clusters species; label them explicitly as 97% sequence clusters.
 
 ```{bash cluster-sensitivity, eval=FALSE}
@@ -1893,24 +2340,29 @@ cd "${LSU_PHYLO_DIR}"
 
 This clustering must be applied only to the phylogenetically validated AMF IDs
 before count aggregation. The mapping is retained as supplementary provenance.
+Do not use it to revive the paused alpha-diversity or beta-diversity tests
+without first resolving low-depth and zero-detection handling.
 
-# 13. Reproducibility record
+# 11. Reproducibility record
 
 ```{r reproducibility}
 analysis_manifest <- tibble(
   item = c(
     "Marker", "Platform", "Forward primer", "Reverse primer",
     "AMF reference database", "AMF classification",
-    "Negative controls", "Sample relationship",
+    "Negative controls", "Positive controls", "Replicate PCRs",
+    "Sample relationship",
     "Beta feature minimum total", "Beta feature minimum prevalence",
-    "Target alpha-diversity coverage"
+    "Alpha-diversity coverage analysis"
   ),
   value = c(
     "Fungal LSU", "PacBio HiFi", FWD, REV,
     "V18 LSU database/backbone, May 2025",
     "Constrained phylogenetic placement and V18 clade extraction",
-    "None in LSU library", "Independent samples; no pairing",
-    MIN_TOTAL_READS_BETA, MIN_PREVALENCE_BETA, TARGET_COVERAGE
+    "None in LSU library", "None in LSU library", "None for LSU",
+    "Independent samples; no pairing",
+    MIN_TOTAL_READS_BETA, MIN_PREVALENCE_BETA,
+    "Paused: singleton-based coverage is uninformative for this processed table"
   )
 )
 
@@ -1934,7 +2386,6 @@ sessionInfo()
   identification could not be performed.
 - Emphasize effect sizes, uncertainty, and dispersion diagnostics; n = 2–3 per
   host–compartment cell gives limited power.
-
 
 
 <!-- # 8. Taxonomy Assignment -->
