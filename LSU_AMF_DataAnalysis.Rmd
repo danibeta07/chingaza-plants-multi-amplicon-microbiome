@@ -978,89 +978,319 @@ cat("V18 placement workspace prepared at:\n", phylo_dir, "\n")
 ## 5.2 Permissive BLAST pre-screen
 
 ```{bash v18-prescreen, eval=FALSE}
-The remaining placement steps run locally. Install the command-line programs
-once from the RStudio **Terminal** (not the R Console):
-
-conda create -n amf_v18_local -c conda-forge -c bioconda \
-  blast=2.16.0 mafft=7.526 raxml=8.2.13 vsearch=2.22.1
-```
-Do not create this environment from the supplied
-`amf_pipeline_requirements.yml` on this Mac: that file pins Linux-only packages.
-After installation, restart R, run sections 1 through 5.1, and then run the
-chunk below. It uses the local `phylo_dir` created in the paths chunk. BLAST is
-used only to reduce the number of sequences sent to tree building. A BLAST hit
-is **not** an AMF call. The permissive E-value is intentional; phylogenetic
-position makes the final decision.
-```{bash v18-prescreen, eval=FALSE}
 set -euo pipefail
+
 : "${AMF_CONDA_EXE:?Run the R paths chunk first}"
 : "${AMF_CONDA_ENV:?Run the R paths chunk first}"
 : "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
 cd "${LSU_PHYLO_DIR}"
-# Remove the empty file that can be left by a failed piped command.
-rm -f candidate_ASV_ids.txt
+
+# Remove results derived from the earlier AMF-only screen so they cannot be
+# reused accidentally before the competitive screen has been processed.
+rm -f \
+  candidate_ASV_ids.txt \
+  V18_competitive_blast.tsv \
+  V18_competitive_blast_audit.tsv \
+  ASVrepseqs_clean_BLAST.fasta \
+  ASVtable_clean_BLASTonly.tsv \
+  V18_plus_candidates_aligned.fasta
+
 "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" makeblastdb \
-  -in V18_LSUDB_052025_AMFONLY.fasta \
+  -in V18_LSUDB_052025.fasta \
   -dbtype nucl \
-  -out V18_LSUDB_052025_AMFONLY
+  -out V18_LSUDB_052025_full
+
 "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" blastn \
   -query ASVrepseqs_clean.fasta \
-  -db V18_LSUDB_052025_AMFONLY \
+  -db V18_LSUDB_052025_full \
   -evalue 1e-3 \
-  -max_target_seqs 1 \
-  -outfmt '6 qseqid' \
-  | sort -u > candidate_ASV_ids.txt
-test -s candidate_ASV_ids.txt || {
-  echo "ERROR: BLAST produced no candidate ASV IDs." >&2
+  -max_target_seqs 5 \
+  -num_threads 10 \
+  -outfmt '6 qseqid sseqid pident length qlen evalue bitscore' \
+  -out V18_competitive_blast.tsv
+
+test -s V18_competitive_blast.tsv || {
+  echo "ERROR: competitive V18 BLAST produced no hits." >&2
   exit 1
 }
-wc -l candidate_ASV_ids.txt
+wc -l V18_competitive_blast.tsv
 ```
+
 ## 5.3 Create candidate files
-Run this chunk after `candidate_ASV_ids.txt` exists.
+
+Run this chunk after `V18_competitive_blast.tsv` exists. The complete audit
+table is retained so every inclusion and exclusion can be reviewed.
+
 ```{r subset-v18-candidates}
+blast_file <- file.path(phylo_dir, "V18_competitive_blast.tsv")
 candidate_file <- file.path(phylo_dir, "candidate_ASV_ids.txt")
-if (file.exists(candidate_file)) {
-  candidate_ids <- scan(candidate_file, what = character(), quiet = TRUE)
-  candidate_ids <- intersect(candidate_ids, asv_ids)
-  if (length(candidate_ids) == 0) stop("BLAST pre-screen returned no valid ASV IDs.")
+
+if (file.exists(blast_file)) {
+  blast_hits <- readr::read_tsv(
+    blast_file,
+    col_names = c(
+      "ASV_ID", "Reference_ID", "Percent_identity", "Alignment_length",
+      "Query_length", "Evalue", "Bitscore"
+    ),
+    show_col_types = FALSE
+  )
+
+  amf_reference_ids <- names(readDNAStringSet(
+    file.path(phylo_dir, "V18_LSUDB_052025_AMFONLY.fasta")
+  ))
+
+  blast_hits <- blast_hits %>%
+    mutate(
+      Query_coverage = Alignment_length / Query_length,
+      AMF_reference = Reference_ID %in% amf_reference_ids
+    )
+
+  best_amf <- blast_hits %>%
+    filter(AMF_reference) %>%
+    arrange(ASV_ID, desc(Bitscore), Evalue, desc(Query_coverage)) %>%
+    distinct(ASV_ID, .keep_all = TRUE) %>%
+    transmute(
+      ASV_ID,
+      AMF_reference_ID = Reference_ID,
+      AMF_percent_identity = Percent_identity,
+      AMF_alignment_length = Alignment_length,
+      Query_length,
+      AMF_query_coverage = Query_coverage,
+      AMF_evalue = Evalue,
+      AMF_bitscore = Bitscore
+    )
+
+  best_outgroup <- blast_hits %>%
+    filter(!AMF_reference) %>%
+    arrange(ASV_ID, desc(Bitscore), Evalue, desc(Query_coverage)) %>%
+    distinct(ASV_ID, .keep_all = TRUE) %>%
+    transmute(
+      ASV_ID,
+      Outgroup_reference_ID = Reference_ID,
+      Outgroup_bitscore = Bitscore
+    )
+
+  blast_audit <- full_join(best_amf, best_outgroup, by = "ASV_ID") %>%
+    mutate(
+      Candidate_for_placement =
+        !is.na(AMF_bitscore) &
+        AMF_query_coverage >= 0.50 &
+        (is.na(Outgroup_bitscore) | AMF_bitscore >= Outgroup_bitscore)
+    ) %>%
+    arrange(desc(Candidate_for_placement), ASV_ID)
+
+  readr::write_tsv(
+    blast_audit,
+    file.path(phylo_dir, "V18_competitive_blast_audit.tsv")
+  )
+
+  candidate_ids <- blast_audit %>%
+    filter(Candidate_for_placement) %>%
+    pull(ASV_ID) %>%
+    intersect(asv_ids)
+
+  if (length(candidate_ids) == 0) {
+    stop("Competitive V18 BLAST pre-screen returned no candidate ASVs.")
+  }
+  writeLines(candidate_ids, candidate_file)
+
   candidate_set <- asv_set[candidate_ids]
   writeXStringSet(
     candidate_set,
     file.path(phylo_dir, "ASVrepseqs_clean_BLAST.fasta"),
     width = 10000
   )
+
   candidate_counts <- count_export %>% filter(X.ASV.ID %in% candidate_ids)
   readr::write_tsv(
     candidate_counts,
     file.path(phylo_dir, "ASVtable_clean_BLASTonly.tsv")
   )
   cat(length(candidate_ids), "candidate ASVs prepared for placement.\n")
+  print(blast_audit %>% count(Candidate_for_placement))
 } else {
-  cat("candidate_ASV_ids.txt is not present yet; run section 5.2, then rerun this chunk.\n")
+  cat("V18_competitive_blast.tsv is not present yet; run section 5.2 first.\n")
 }
 ```
 
 ## 5.4 Reference-coordinate alignment
+
 This uses V18 as the alignment reference and drops LR5-region overhangs that are
 not represented in V18. It therefore compares homologous LSU positions while
 retaining the LR0R–LR5 reads for ASV inference and archiving.
+
 ```{bash v18-alignment, eval=FALSE}
 set -euo pipefail
+
 : "${AMF_CONDA_EXE:?Run the R paths chunk first}"
 : "${AMF_CONDA_ENV:?Run the R paths chunk first}"
 : "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
 cd "${LSU_PHYLO_DIR}"
+
 "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" mafft \
   --auto --thread -1 \
   V18_LSUDB_052025.fasta \
   > V18_LSUDB_052025_aligned.fasta
+
 "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" mafft \
   --addfragments ASVrepseqs_clean_BLAST.fasta \
   --keeplength --thread -1 \
   V18_LSUDB_052025_aligned.fasta \
   > V18_plus_candidates_aligned.fasta
 ```
+
+## 5.5 Split aligned ASVs into constrained-tree batches
+
+```{r make-placement-batches}
+aligned_file <- file.path(phylo_dir, "V18_plus_candidates_aligned.fasta")
+backbone_file <- file.path(phylo_dir, "Root_V18_LSUDB_052025.newick")
+
+if (file.exists(aligned_file)) {
+  aligned <- readDNAStringSet(aligned_file)
+  names(aligned) <- trimws(names(aligned))
+
+if (anyDuplicated(names(aligned))) {
+  stop("Duplicate sequence identifiers after trimming FASTA headers.")
+}
+  backbone <- read.tree(backbone_file)
+
+  missing_backbone_tips <- setdiff(backbone$tip.label, names(aligned))
+  if (length(missing_backbone_tips) > 0) {
+    stop(
+      "Aligned FASTA is missing backbone tips; first missing tip: ",
+      missing_backbone_tips[[1]]
+    )
+  }
+
+  reference_aligned <- aligned[backbone$tip.label]
+  query_aligned <- aligned[grepl("^ASV[0-9]+$", names(aligned))]
+  if (length(query_aligned) == 0) stop("No aligned ASV sequences found.")
+
+  batch_size <- 15L  # follows the validated V18 pipeline's placement batch size
+  batch_id <- ceiling(seq_along(query_aligned) / batch_size)
+  batch_dir <- file.path(phylo_dir, "batches")
+  old_batches <- list.files(batch_dir, pattern = "^batch_[0-9]+\\.fasta$", full.names = TRUE)
+  if (length(old_batches) > 0) file.remove(old_batches)
+
+  for (i in sort(unique(batch_id))) {
+    batch_queries <- query_aligned[batch_id == i]
+    writeXStringSet(
+      c(reference_aligned, batch_queries),
+      file.path(batch_dir, sprintf("batch_%04d.fasta", i)),
+      width = 10000
+    )
+  }
+
+  cat(length(unique(batch_id)), "tree batches created for", length(query_aligned), "ASVs.\n")
+} else {
+  cat("Aligned candidate file not found; run section 5.4, then rerun this chunk.\n")
+}
+```
+
+## 5.6 Constrained placement and V18 clade extraction
+
+The command below uses classic RAxML because the V18 extraction scripts expect
+its tree filenames. It processes batches sequentially and gives each tree eight
+threads. This can take many hours or days on a laptop, depending on how many
+candidate ASVs pass BLAST. Keep the Mac connected to power and prevent system
+sleep while this chunk is running. The generic threaded executable is used
+instead of the AVX2 build because this Mac has Apple Silicon.
+
+```{bash v18-constrained-trees, eval=FALSE}
+set -euo pipefail
+
+: "${AMF_CONDA_EXE:?Run the R paths chunk first}"
+: "${AMF_CONDA_ENV:?Run the R paths chunk first}"
+: "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
+cd "${LSU_PHYLO_DIR}"
+
+mkdir -p RAxMLfiles cladeOutputs
+
+RAXML_BIN=$("${AMF_CONDA_EXE}" run -n "${AMF_CONDA_ENV}" sh -c \
+  'command -v raxmlHPC-PTHREADS || command -v raxmlHPC-PTHREADS-SSE3 || command -v raxmlHPC')
+test -n "${RAXML_BIN}" || {
+  echo "ERROR: no non-AVX classic RAxML executable was found." >&2
+  exit 1
+}
+
+shopt -s nullglob
+alignments=(batches/batch_*.fasta)
+test "${#alignments[@]}" -gt 0 || {
+  echo "ERROR: no placement batches were found; run section 5.5 first." >&2
+  exit 1
+}
+
+for alignment in "${alignments[@]}"; do
+  batch_name=$(basename "$alignment" .fasta)
+  run_name="${batch_name}_AMFtree.ENVbackbone"
+  best_tree="RAxMLfiles/RAxML_bestTree.${run_name}"
+
+  if [[ -s "${best_tree}" ]]; then
+    echo "Skipping completed ${batch_name}"
+    continue
+  fi
+
+  # Remove only incomplete outputs for this exact batch before retrying it.
+  rm -f \
+    "RAxMLfiles/RAxML_info.${run_name}" \
+    "RAxMLfiles/RAxML_log.${run_name}" \
+    "RAxMLfiles/RAxML_result.${run_name}" \
+    "RAxMLfiles/RAxML_parsimonyTree.${run_name}"
+
+  "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" \
+    "${RAXML_BIN}" \
+    -f d \
+    -m GTRGAMMA \
+    -p 1723 \
+    -N 100 \
+    -r Root_V18_LSUDB_052025.newick \
+    -s "$alignment" \
+    -n "${run_name}" \
+    -T 8 \
+    -w "$(pwd)/RAxMLfiles"
+done
+```
+
+Run the extraction in the current RStudio R session so it uses the same R and
+package library as the notebook:
+
+```{r v18-clade-extraction}
+batch_files <- list.files(
+  file.path(phylo_dir, "batches"),
+  pattern = "^batch_[0-9]+\\.fasta$",
+  full.names = TRUE
+)
+expected_best_trees <- file.path(
+  phylo_dir,
+  "RAxMLfiles",
+  paste0(
+    "RAxML_bestTree.",
+    tools::file_path_sans_ext(basename(batch_files)),
+    "_AMFtree.ENVbackbone"
+  )
+)
+missing_best_trees <- expected_best_trees[!file.exists(expected_best_trees)]
+
+if (length(batch_files) == 0) {
+  cat("No placement batches found; complete sections 5.2–5.5 first.\n")
+} else if (length(missing_best_trees) > 0) {
+  cat(
+    length(batch_files) - length(missing_best_trees), "of", length(batch_files),
+    "expected RAxML best trees are present; finish section 5.6 before extraction.\n"
+  )
+} else {
+  old_wd <- setwd(phylo_dir)
+  on.exit(setwd(old_wd), add = TRUE)
+  source("AMFcladesExtract.R", local = new.env(parent = globalenv()))
+  source("AMFcladeTaxonomy.R", local = new.env(parent = globalenv()))
+  cat("V18 AMF clade extraction and taxonomy are complete.\n")
+}
+```
+
+The expected final file is
+`analysis_output_corrected/V18_phylogenetic_placement/ASVtable_clean_AMFonly_taxonomy.tsv`.
+Do not continue with ecological inference until all batches finish and that file
+has been generated.
 # 6. Import phylogenetically validated AMF ASVs
 
 ```{r v18-taxonomy-checkpoint}
@@ -1415,12 +1645,19 @@ contains structural zeros. The primary tests below use only estimable subsets.
 
 ## 10.1 Prespecified, estimable PERMANOVA models
 
-1. BR versus BS among the four host genera having both compartments.
-2. Rh versus root among the three host genera having both compartments.
+1. BR versus BS among the four host genera having both compartments, adjusted
+   for host genus with an additive model.
+2. Rh versus root among the three host genera having both compartments, adjusted
+   for host genus with an additive model.
 3. Within-host compartment tests, with independent samples and no blocking.
 
 All tests are accompanied by PERMDISP. A significant PERMANOVA with significant
 dispersion must not be described simply as a centroid/composition difference.
+The shared-compartment models are additive because the primary estimand is the
+overall compartment contrast after accounting for host. Host-specific tests
+below are used to examine whether the pattern is consistent among hosts; the
+small cell sizes do not support a reliable omnibus host-by-compartment
+interaction test.
 
 ```{r permanova-functions}
 subset_beta_data <- function(sample_ids) {
@@ -1460,12 +1697,12 @@ root_rh_ids <- rownames(meta_beta)[
 
 test_soil <- run_design_test(
   "BR_vs_BS_across_four_hosts", soil_ids,
-  "Host_species * Compartment", "Compartment"
+  "Host_species + Compartment", "Compartment"
 )
 
 test_root_rh <- run_design_test(
   "Rh_vs_root_across_three_hosts", root_rh_ids,
-  "Host_species * Compartment", "Compartment"
+  "Host_species + Compartment", "Compartment"
 )
 
 test_soil$permanova
@@ -1487,7 +1724,14 @@ capture.output(test_root_rh$dispersion,
 within_host_tests <- lapply(levels(meta_beta$Host_species), function(host) {
   ids <- rownames(meta_beta)[meta_beta$Host_species == host]
   md <- droplevels(meta_beta[ids, , drop = FALSE])
-  if (nrow(md) < 4 || nlevels(md$Compartment) < 2 || any(table(md$Compartment) < 2)) {
+
+  compartment_n <- table(md$Compartment)
+  tested_parts <- names(compartment_n)[compartment_n >= 2]
+  excluded_parts <- names(compartment_n)[compartment_n < 2]
+  ids <- ids[meta_beta[ids, "Compartment"] %in% tested_parts]
+  md <- droplevels(meta_beta[ids, , drop = FALSE])
+
+  if (nrow(md) < 4 || nlevels(md$Compartment) < 2) {
     return(NULL)
   }
 
@@ -1502,6 +1746,12 @@ within_host_tests <- lapply(levels(meta_beta$Host_species), function(host) {
     Host_species = host,
     n = nrow(md),
     compartments = nlevels(md$Compartment),
+    tested_compartments = paste(levels(md$Compartment), collapse = "; "),
+    excluded_singleton_compartments = if_else(
+      length(excluded_parts) == 0,
+      NA_character_,
+      paste(excluded_parts, collapse = "; ")
+    ),
     R2 = perm$R2[1],
     F = perm$F[1],
     p_PERMANOVA = perm$`Pr(>F)`[1],
@@ -1630,15 +1880,15 @@ set -euo pipefail
 
 : "${AMF_CONDA_EXE:?Run the R paths chunk first}"
 : "${AMF_CONDA_ENV:?Run the R paths chunk first}"
-: "${LSU_OUT_DIR:?Run the R paths chunk first}"
-cd "${LSU_OUT_DIR}"
+: "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
+cd "${LSU_PHYLO_DIR}"
 
 "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" vsearch \
-  --cluster_size LSU_ASVs.fasta \
+  --cluster_size cladeOutputs/ASVrepseqs_clean_AMFonly.fasta \
   --id 0.97 \
   --strand plus \
-  --centroids LSU_ASVs_97pct_centroids.fasta \
-  --uc LSU_ASVs_97pct.uc
+  --centroids cladeOutputs/AMF_ASVs_97pct_centroids.fasta \
+  --uc cladeOutputs/AMF_ASVs_97pct.uc
 ```
 
 This clustering must be applied only to the phylogenetically validated AMF IDs
@@ -1684,6 +1934,7 @@ sessionInfo()
   identification could not be performed.
 - Emphasize effect sizes, uncertainty, and dispersion diagnostics; n = 2–3 per
   host–compartment cell gives limited power.
+
 
 
 <!-- # 8. Taxonomy Assignment -->
