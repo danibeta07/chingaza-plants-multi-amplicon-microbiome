@@ -100,7 +100,7 @@ Sys.setenv(
 
 # Workflow switches
 RUN_DADA2 <- FALSE          # FALSE reuses seqtab_path
-PREPARE_PHYLOGENY <- TRUE   # prepares the clean V18 placement directory
+PREPARE_PHYLOGENY <- FALSE   # prepares the clean V18 placement directory
 RUN_ANCOMBC2 <- FALSE       # enable only after reviewing AMF depth/coverage
 
 FWD <- "ACCCGCTGAACTTAAGC"  # LR0R, gene-specific sequence
@@ -129,6 +129,113 @@ cat("Forward primer (LROR):", FWD, "\n")
 cat("Reverse primer (LR5):", REV, "\n")
 cat("Expected amplicon range:", MIN_LEN, "-", MAX_LEN, "bp\n")
 ```
+# Broad LSU taxonomy paths
+```{r}
+broad_tax_dir <- file.path(out_path, "broad_LSU_taxonomy")
+
+euk_taxonomy_file <- file.path(
+  broad_tax_dir,
+  "EUKARYOME_LSU_v2.1_taxonomy_minBoot80.tsv"
+)
+
+euk_bootstrap_file <- file.path(
+  broad_tax_dir,
+  "EUKARYOME_LSU_v2.1_bootstraps.tsv"
+)
+
+all_asv_fasta <- file.path(
+  phylo_dir,
+  "ASVrepseqs_clean.fasta"
+)
+
+stopifnot(
+  file.exists(euk_taxonomy_file),
+  file.exists(euk_bootstrap_file),
+  file.exists(all_asv_fasta)
+)
+
+# Map nucleotide sequences back to ASV1, ASV2, etc.
+all_asv_sequences <- Biostrings::readDNAStringSet(all_asv_fasta)
+
+sequence_asv_map <- tibble(
+  ASV_ID = names(all_asv_sequences),
+  Sequence = toupper(as.character(all_asv_sequences))
+)
+
+if (anyDuplicated(sequence_asv_map$ASV_ID)) {
+  stop("Duplicate ASV IDs in the representative-sequence FASTA.")
+}
+
+if (anyDuplicated(sequence_asv_map$Sequence)) {
+  stop("Duplicate nucleotide sequences in the representative-sequence FASTA.")
+}
+
+# EUKARYOME taxonomy
+euk_taxonomy_raw <- readr::read_tsv(
+  euk_taxonomy_file,
+  col_types = readr::cols(.default = readr::col_character())
+)
+
+euk_taxonomy <- euk_taxonomy_raw %>%
+  rename(Sequence = ASV_ID) %>%
+  mutate(Sequence = toupper(Sequence)) %>%
+  left_join(sequence_asv_map, by = "Sequence") %>%
+  relocate(ASV_ID, .before = Sequence)
+
+# EUKARYOME bootstrap values
+euk_bootstrap_raw <- readr::read_tsv(
+  euk_bootstrap_file,
+  col_types = readr::cols(.default = readr::col_character())
+)
+
+euk_bootstraps <- euk_bootstrap_raw %>%
+  rename(Sequence = ASV_ID) %>%
+  mutate(Sequence = toupper(Sequence)) %>%
+  left_join(sequence_asv_map, by = "Sequence") %>%
+  relocate(ASV_ID, .before = Sequence)
+
+# Integrity checks
+if (nrow(euk_taxonomy) != 4631) {
+  stop("Unexpected number of EUKARYOME taxonomy rows.")
+}
+
+if (anyNA(euk_taxonomy$ASV_ID)) {
+  stop("At least one EUKARYOME sequence could not be mapped to an ASV ID.")
+}
+
+if (anyDuplicated(euk_taxonomy$ASV_ID)) {
+  stop("Duplicate ASV IDs after mapping EUKARYOME taxonomy.")
+}
+
+if (!setequal(euk_taxonomy$ASV_ID, sequence_asv_map$ASV_ID)) {
+  stop("EUKARYOME and representative-sequence ASV sets do not match.")
+}
+
+cat(
+  nrow(euk_taxonomy),
+  "EUKARYOME classifications mapped successfully to ASV IDs.\n"
+)
+
+# Save corrected, analysis-ready versions
+readr::write_tsv(
+  euk_taxonomy,
+  file.path(
+    broad_tax_dir,
+    "EUKARYOME_LSU_v2.1_taxonomy_ASV_ID.tsv"
+  )
+)
+
+readr::write_tsv(
+  euk_bootstraps,
+  file.path(
+    broad_tax_dir,
+    "EUKARYOME_LSU_v2.1_bootstraps_ASV_ID.tsv"
+  )
+)
+```
+
+
+
 # 2 Metadata validation
 
 ```{r}
