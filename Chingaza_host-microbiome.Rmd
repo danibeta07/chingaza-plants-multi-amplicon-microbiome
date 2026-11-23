@@ -1,0 +1,2526 @@
+---
+title: "Chingaza plant microbiomes manuscript analyses"
+author: "Daniela Betancurt-Anzola"
+output:
+  html_document:
+    toc: true
+    code_folding: show
+params:
+  data_root: "."
+  output_dir: "paper_output"
+  refit_ancom: false
+---
+
+The current manuscript figures are rebuilt from frozen counts and classifications. Archive sequence-processing chunks have `eval=FALSE`. Set `refit_ancom: true` to refit the nine exploratory contrasts.
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+required <- c("phyloseq", "qiime2R", "dplyr", "tidyr", "tibble", "readr", "ggplot2",
+              "vegan", "permute", "ggrepel", "scales", "patchwork", "pheatmap", "RColorBrewer")
+if (isTRUE(params$refit_ancom)) required <- c(required, "ANCOMBC")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install required packages: ", paste(missing, collapse = ", "))
+suppressPackageStartupMessages({
+  library(phyloseq); library(dplyr); library(tidyr); library(tibble); library(ggplot2)
+})
+manifest <- read.csv("Paper_repository_files.csv", check.names = FALSE)
+paper_input <- function(key) {
+  i <- match(key, manifest$Key)
+  if (is.na(i)) stop("Unknown input key: ", key)
+  repo <- file.path(params$data_root, manifest$Repo_path[i])
+  path <- if (file.exists(repo)) repo else manifest$Local_source[i]
+  if (!file.exists(path)) stop("Missing input ", key, ": ", repo)
+  normalizePath(path)
+}
+paper_out <- path.expand(params$output_dir)
+dir.create(paper_out, recursive = TRUE, showWarnings = FALSE)
+paper_out <- normalizePath(paper_out)
+section_out <- function(name) {
+  path <- file.path(paper_out, name)
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  path
+}
+set.seed(20260924)
+```
+
+## Illumina phylum profiles and dbRDA
+
+The phylum plots and dbRDA retain the filtering and transformations. dbRDA uses unrarefied counts. Its axis percentages describe constrained variation. PERMANOVA uses rarefied counts and unrestricted permutations.
+
+```{r illumina-figures, fig.width=12, fig.height=6}
+paper_illumina <- local({
+  suppressPackageStartupMessages({
+    library(phyloseq)
+    library(qiime2R)
+    library(dplyr)
+    library(tibble)
+    library(ggplot2)
+    library(vegan)
+    library(ggrepel)
+  })
+  compartment_pal <- c(Bulk_Soil = "#8B4513", Rhizosphere = "#FFD700",
+                       Endosphere = "#228B22", Aboveground = "#87CEEB")
+  fungal_soil_pal <- c(Ascomycota = "#E69F00", Basidiomycota = "#56B4E9",
+    Blastocladiomycota = "#808000", Glomeromycota = "#A6192E",
+    Mortierellomycota = "#009E73", Mucoromycota = "#D55E00",
+    Chytridiomycota = "#8E63B0", Rozellomycota = "#8FBC8F",
+    Entorrhizomycota = "#A6761D", Monoblepharomycota = "#C070B1",
+    Kickxellomycota = "#7FBC41", Neocallimastigomycota = "#B38642",
+    Fungi_phy_Incertae_sedis = "#999999", Zoopagomycota = "#9C755F",
+    Other = "#444444")
+  part_order <- c("BR", "BS", "Rh", "SP", "root", "stolon", "BG", "AG", "leaf")
+  part_labels <- c(BR = "Soil with roots", BS = "Soil without roots",
+    Rh = "Rhizosphere", SP = "Stolonosphere", root = "Root endosphere",
+    stolon = "Stolon endosphere", BG = "Belowground endosphere",
+    AG = "Aboveground endosphere", leaf = "Leaf endosphere")
+  models <- list()
+  soil_plots <- list()
+  qc <- list()
+  for (marker in c("16S", "ITS")) {
+    prefix <- if (marker == "16S") "s16" else "its"
+    load_ps <- function(meta_key) qiime2R::qza_to_phyloseq(
+      features = paper_input(paste0(prefix, "_table")),
+      taxonomy = paper_input(paste0(prefix, "_taxonomy")),
+      metadata = paper_input(paste0(prefix, "_", meta_key)))
+    ps <- load_ps("meta")
+    ps_all <- load_ps("meta_all")
+    filter_taxa <- function(x) {
+      if (marker == "16S") {
+        x <- subset_taxa(x, !grepl("chloroplast", Order, ignore.case = TRUE) | is.na(Order))
+        x <- subset_taxa(x, !grepl("mitochondria", Family, ignore.case = TRUE) | is.na(Family))
+        subset_taxa(x, !is.na(Kingdom) & Kingdom != "" &
+                      !grepl("Unassigned", Kingdom, ignore.case = TRUE))
+      } else {
+        subset_taxa(x, !is.na(Kingdom) & grepl("Fungi", Kingdom, ignore.case = TRUE))
+      }
+    }
+    ps <- filter_taxa(ps)
+    ps_all <- filter_taxa(ps_all)
+    ps <- prune_samples(sample_sums(ps) >= if (marker == "16S") 10000 else 15000, ps)
+    # The original 16S fine-part bars retain all samples after taxon filtering.
+    if (marker == "ITS") ps_all <- prune_samples(sample_sums(ps_all) >= 15000, ps_all)
+    qc[[marker]] <- data.frame(Marker = marker, Sample = sample_names(ps_all),
+      Retained_reads = unname(sample_sums(ps_all)),
+      Used_in_dbRDA = sample_names(ps_all) %in% sample_names(ps))
+    phy <- transform_sample_counts(tax_glom(ps, "Phylum"), function(x) x / sum(x) * 100)
+    top <- psmelt(phy) %>% group_by(Phylum) %>%
+      summarise(Total = sum(Abundance), .groups = "drop") %>% arrange(desc(Total)) %>%
+      slice_head(n = if (marker == "16S") 10 else 8) %>% pull(Phylum)
+    palette <- setNames(c(RColorBrewer::brewer.pal(length(top),
+      if (marker == "16S") "Paired" else "Set2"),
+      if (marker == "16S") "grey70" else "black"), c(sort(top), "Other"))
+    fine <- transform_sample_counts(tax_glom(ps_all, "Phylum"), function(x) x / sum(x) * 100)
+    df <- psmelt(fine) %>% mutate(
+      Phylum_grouped = factor(ifelse(Phylum %in% top, Phylum, "Other"),
+                              levels = c(sort(top), "Other")),
+      Part = factor(Shortened_description, levels = part_order))
+    df <- df %>% group_by(Sample, Host_species, Part, Phylum_grouped) %>%
+      summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+      arrange(Host_species, Part, Sample)
+    df$Sample <- factor(df$Sample, levels = unique(as.character(df$Sample)))
+    write.csv(df, file.path(paper_out, paste0(marker, "_phylum_plot_data.csv")), row.names = FALSE)
+    bar_plot <- function(d, colors) {
+      ggplot(d, aes(Sample, Abundance, fill = Phylum_grouped)) +
+        geom_col(colour = "black", linewidth = 0.1) +
+        scale_fill_manual(values = colors, name = paste(marker, "Phylum")) +
+        scale_y_continuous(expand = expansion(mult = 0)) +
+        coord_cartesian(ylim = c(0, 100)) +
+        labs(x = NULL, y = "Relative abundance (%)") + theme_minimal() +
+        theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          panel.grid.major.x = element_blank(), legend.position = "bottom")
+    }
+    for (host in unique(df$Host_species)) {
+      p <- bar_plot(df[df$Host_species == host, ], palette) +
+        facet_grid(. ~ Part, scales = "free_x", space = "free_x",
+                   labeller = as_labeller(part_labels)) + labs(title = host)
+      ggsave(file.path(paper_out, paste0(marker, "_phylum_", host, ".pdf")),
+             p, width = 11, height = 5, useDingbats = FALSE)
+    }
+    all_parts <- bar_plot(df, palette) + facet_grid(. ~ Host_species + Part,
+      scales = "free_x", space = "free_x", labeller = label_wrap_gen(10))
+    ggsave(file.path(paper_out, paste0(marker, "_phylum_all_hosts.pdf")),
+           all_parts, width = 16, height = 6, useDingbats = FALSE)
+    soil <- df[df$Part %in% c("BR", "BS"), ]
+    soil_colors <- if (marker == "ITS") fungal_soil_pal else palette
+    stopifnot(all(unique(as.character(soil$Phylum_grouped)) %in% names(soil_colors)))
+    soil_lookup <- distinct(soil, Sample, Part)
+    soil_labels <- setNames(ifelse(soil_lookup$Part == "BR", "Soil with roots", "Soil without roots"), as.character(soil_lookup$Sample))
+    soil_plots[[marker]] <- bar_plot(soil, soil_colors) +
+      scale_x_discrete(labels = soil_labels) +
+      guides(fill = guide_legend(ncol = 3)) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5, size = 7)) +
+      facet_grid(. ~ Host_species, scales = "free_x", space = "free_x") + labs(title = marker)
+    ggsave(file.path(paper_out, paste0(marker, "_phylum_soil_only.pdf")),
+           soil_plots[[marker]], width = 12, height = 6, useDingbats = FALSE)
+    bray <- phyloseq::distance(ps, "bray")
+    meta <- as(sample_data(ps), "data.frame")
+    cap <- vegan::capscale(bray ~ Broad_Compartment + Host_species, data = meta)
+    sites <- cbind(as.data.frame(vegan::scores(cap, display = "sites")), meta)
+    bp <- as.data.frame(vegan::scores(cap, display = "bp"))
+    bp$Label <- rownames(bp)
+    axis_pct <- 100 * cap$CCA$eig[1:2] / sum(cap$CCA$eig)
+    p_cap <- ggplot(sites, aes(CAP1, CAP2)) +
+      geom_point(aes(color = Broad_Compartment, shape = Host_species), size = 3, alpha = .8) +
+      scale_color_manual(values = compartment_pal) +
+      geom_segment(data = bp, inherit.aes = FALSE,
+        aes(x = 0, y = 0, xend = CAP1 * .9, yend = CAP2 * .9),
+        arrow = arrow(length = grid::unit(.2, "cm")), colour = "black") +
+      ggrepel::geom_text_repel(data = bp, inherit.aes = FALSE,
+        aes(CAP1 * .95, CAP2 * .95, label = Label), size = 3) +
+      labs(title = paste(marker, "dbRDA"),
+        x = sprintf("CAP1 (%.1f%% constrained variation)", axis_pct[1]),
+        y = sprintf("CAP2 (%.1f%% constrained variation)", axis_pct[2])) +
+      theme_minimal() + theme(legend.position = "bottom")
+    ggsave(file.path(paper_out, paste0(marker, "_dbRDA.pdf")), p_cap,
+           width = 10, height = 8, useDingbats = FALSE)
+    set.seed(20261123)
+    a <- as.data.frame(anova(cap, by = "terms", permutations = 999))
+    a$Term <- rownames(a)
+    a$Raw_p_value <- a$`Pr(>F)`
+    a$BH_adjusted_p_value <- NA_real_
+    tested <- !is.na(a$Raw_p_value)
+    a$BH_adjusted_p_value[tested] <- p.adjust(a$Raw_p_value[tested], "BH")
+    a$Adjustment_family <- paste(marker, "two sequential dbRDA terms")
+    write.csv(a, file.path(paper_out, paste0(marker, "_dbRDA_terms.csv")), row.names = FALSE)
+    write.csv(data.frame(Marker = marker,
+      Constrained_fraction = cap$CCA$tot.chi / cap$tot.chi,
+      Adjusted_R2 = vegan::RsquareAdj(cap)$adj.r.squared,
+      Axis1_percent_constrained = axis_pct[1], Axis2_percent_constrained = axis_pct[2],
+      N_samples = nsamples(ps)), file.path(paper_out, paste0(marker, "_dbRDA_summary.csv")), row.names = FALSE)
+    # Retain the source PERMANOVA rarefaction and model definitions.
+    set.seed(42)
+    rare <- rarefy_even_depth(ps, sample.size = min(sample_sums(ps)), rngseed = 42,
+                             replace = FALSE, verbose = FALSE)
+    rare_bray <- phyloseq::distance(rare, "bray")
+    rare_meta <- as(sample_data(rare), "data.frame")
+    set.seed(20261123)
+    perm_models <- list(
+      compartment = vegan::adonis2(rare_bray ~ Broad_Compartment, data = rare_meta, permutations = 999),
+      host = vegan::adonis2(rare_bray ~ Host_species, data = rare_meta, permutations = 999),
+      interaction = vegan::adonis2(rare_bray ~ Broad_Compartment * Host_species,
+        data = rare_meta, permutations = 999, by = "terms"))
+    tests <- bind_rows(lapply(names(perm_models), function(nm) {
+      z <- as.data.frame(perm_models[[nm]])
+      z$Term <- rownames(z)
+      z$Model <- nm
+      z
+    }))
+    tests$Raw_p_value <- tests$`Pr(>F)`
+    tests$BH_adjusted_p_value <- NA_real_
+    standalone <- tests$Model %in% c("compartment", "host") & tests$Term == "Model"
+    tests$BH_adjusted_p_value[standalone] <- p.adjust(tests$Raw_p_value[standalone], "BH")
+    interaction <- tests$Model == "interaction" & !is.na(tests$Raw_p_value)
+    tests$BH_adjusted_p_value[interaction] <- p.adjust(tests$Raw_p_value[interaction], "BH")
+    tests$Adjustment_family <- ifelse(tests$Model == "interaction",
+      paste(marker, "sequential interaction-model terms"), paste(marker, "two standalone main-effect tests"))
+    tests$Permutation_design <- "Unrestricted exploratory source analysis"
+    tests$Rarefaction_depth <- min(sample_sums(rare))
+    write.csv(tests, file.path(paper_out, paste0(marker, "_PERMANOVA_source_models.csv")), row.names = FALSE)
+    print(p_cap)
+    models[[marker]] <- list(ps = ps, ps_all = ps_all, dbRDA = cap,
+      phylum = df, soil_plot = soil_plots[[marker]])
+  }
+  write.csv(bind_rows(qc), file.path(paper_out, "Illumina_sample_QC.csv"), row.names = FALSE)
+  models
+})
+```
+# LSU phylum composition
+
+```{r lsu-phylum, fig.width=14, fig.height=6}
+paper_lsu <- local({
+saved_plot_file <- paper_input("lsu_phylum")
+plot_dir <- section_out("LSU_phylum")
+out_path <- plot_dir
+dir.create(file.path(out_path, "figures"), showWarnings = FALSE)
+group_long <- readr::read_tsv(saved_plot_file, show_col_types = FALSE)
+required_plot_columns <- c(
+  "SampleID_join", "Host_species", "Compartment", "Plant_replicate",
+  "Total_LSU_reads", "V18_AMF_reads", "V18_AMF_fraction",
+  "Fungal_group", "Reads", "Relative_abundance"
+)
+if (!all(required_plot_columns %in% names(group_long))) {
+  stop("Saved plot table is missing required columns: ",
+       paste(setdiff(required_plot_columns, names(group_long)), collapse = ", "))
+}
+if (anyNA(group_long[, required_plot_columns]) ||
+    anyDuplicated(group_long[, c("SampleID_join", "Fungal_group")]) ||
+    any(group_long$Reads < 0) || any(group_long$Total_LSU_reads <= 0)) {
+  stop("Saved plot table contains missing, duplicated, or invalid read data.")
+}
+
+sample_check <- group_long %>%
+  group_by(SampleID_join) %>%
+  summarise(
+    across(c(Host_species, Compartment, Plant_replicate,
+             Total_LSU_reads, V18_AMF_reads, V18_AMF_fraction), n_distinct),
+    .groups = "drop"
+  )
+if (any(as.matrix(sample_check[, -1]) != 1)) {
+  stop("Saved plot table has inconsistent metadata within a sample.")
+}
+
+sample_depth <- group_long %>%
+  distinct(SampleID_join, Host_species, Compartment, Plant_replicate,
+           Total_LSU_reads, V18_AMF_reads, V18_AMF_fraction) %>%
+  mutate(Compartment = factor(
+    Compartment,
+    levels = c("BR", "BS", "SP", "Rh", "root", "stolon", "BG", "AG", "leaf")
+  )) %>%
+  arrange(Host_species, Compartment,
+          suppressWarnings(as.numeric(Plant_replicate)),
+          Plant_replicate, SampleID_join)
+
+part_names <- c(BR = "BR", BS = "BS", SP = "SP", Rh = "Rhizosphere",
+                root = "Root endosphere", stolon = "Stolon",
+                BG = "BG", AG = "AG", leaf = "Leaf endosphere")
+
+sample_totals <- group_long %>%
+  group_by(SampleID_join) %>%
+  summarise(Reads = sum(Reads), Share = sum(Relative_abundance),
+            .groups = "drop") %>%
+  left_join(sample_depth %>% select(SampleID_join, Total_LSU_reads),
+            by = "SampleID_join")
+if (anyNA(sample_depth$Compartment) ||
+    any(sample_totals$Reads != sample_totals$Total_LSU_reads) ||
+    any(abs(sample_totals$Share - 1) > 1e-10)) {
+  stop("Saved plot table does not reconcile to 100% for every sample.")
+}
+
+group_long <- group_long %>%
+  mutate(Compartment = factor(
+    Compartment,
+    levels = levels(sample_depth$Compartment)
+  ))
+cat(nrow(sample_depth), "samples;", sum(sample_depth$Total_LSU_reads),
+    "saved LSU reads. No taxonomy or count table was recomputed.\n")
+group_colors <- c(
+  "Ascomycota" = "#E69F00",
+  "Basidiomycota" = "#56B4E9",
+  "Blastocladiomycota" = "#808000",
+  "Glomeromycota" = "#A6192E",
+  "Mortierellomycota" = "#009E73",
+  "Mucoromycota" = "#D55E00",
+  "Chytridiomycota" = "#8E63B0",
+  "Rozellomycota" = "#8FBC8F",
+  "Entorrhizomycota" = "#A6761D",
+  "Monoblepharomycota" = "#C070B1",
+  "Sanchytriomycota" = "#DBB400",
+  "Kickxellomycota" = "#7FBC41",
+  "Neocallimastigomycota" = "#B38642",
+  "Aphelidiomycota" = "#4DBBD5",
+  "Mirabilomycota" = "#E78AC3",
+  "Fungi; phylum unresolved" = "#999999",
+  "V18 placement pending" = "#B0B0B0",
+  "No EUKARYOME result" = "#C9C9C9",
+  "Unclassified by EUKARYOME" = "#D9D9D9",
+  "Other EUKARYOME kingdom" = "#444444"
+)
+if (!all(unique(group_long$Fungal_group) %in% names(group_colors))) {
+  stop("A new fungal-group label needs an explicit plot color.")
+}
+group_long$Fungal_group <- factor(group_long$Fungal_group,
+                                  levels = names(group_colors))
+used_group_names <- names(group_colors)[names(group_colors) %in%
+                                         unique(as.character(group_long$Fungal_group))]
+
+plot_host <- function(host) {
+  host_depth <- sample_depth %>%
+    filter(Host_species == host) %>%
+    mutate(Sample_x = factor(SampleID_join, levels = SampleID_join),
+           AMF_label = scales::percent(V18_AMF_fraction, accuracy = 0.01))
+  host_long <- group_long %>%
+    filter(Host_species == host) %>%
+    mutate(Sample_x = factor(SampleID_join, levels = levels(host_depth$Sample_x)))
+  rep_labels <- setNames(paste0("R", host_depth$Plant_replicate),
+                         host_depth$SampleID_join)
+
+  ggplot(host_long %>% filter(Reads > 0),
+         aes(x = Sample_x, y = Relative_abundance, fill = Fungal_group)) +
+    geom_col(width = 0.86, colour = "white", linewidth = 0.12) +
+    geom_text(data = host_depth, inherit.aes = FALSE,
+              aes(x = Sample_x, y = 1.025, label = AMF_label), size = 2.65) +
+    facet_grid(. ~ Compartment, scales = "free_x", space = "free_x",
+               labeller = as_labeller(part_names)) +
+    scale_fill_manual(values = group_colors, breaks = used_group_names,
+                      drop = FALSE, name = "Fungal phylum / unresolved") +
+    guides(fill = guide_legend(ncol = 2, byrow = TRUE)) +
+    scale_x_discrete(labels = function(x) unname(rep_labels[x])) +
+    scale_y_continuous(breaks = seq(0, 1, 0.25),
+                       labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0))) +
+    coord_cartesian(ylim = c(0, 1.09), clip = "off") +
+    labs(
+      title = paste("LSU -", host),
+      x = "Independent biological sample (replicate)",
+      y = "Share of all non-chimeric LSU reads",
+      caption = paste(
+        "Numbers above bars = V18-validated AMF share of all LSU reads.",
+        "Glomeromycota uses V18 placement where validated; other phyla use EUKARYOME LSU v2.1."
+      )
+    ) +
+    theme_minimal()
+}
+
+for (host in sort(unique(sample_depth$Host_species))) {
+  n_parts <- n_distinct(sample_depth$Compartment[sample_depth$Host_species == host])
+  width <- max(11, 6.4 + 1.2 * n_parts)
+  file <- file.path(plot_dir,
+                    paste0("LSU_all_reads_reconciled_relative_abundance_", host, ".pdf"))
+  ggsave(file, plot_host(host), width = width, height = 5.2,
+         units = "in", device = grDevices::pdf, useDingbats = FALSE)
+  if (!file.exists(file) || file.info(file)$size == 0) stop("PDF export failed: ", file)
+  cat("Wrote:", file, "\n")
+}
+soil_hosts <- c("Chusquea", "Espeletia", "Oritrophium", "Racomitrium")
+soil_depth <- sample_depth %>%
+  filter(Host_species %in% soil_hosts,
+         as.character(Compartment) %in% c("BR", "BS")) %>%
+  mutate(
+    Host_species = factor(Host_species, levels = soil_hosts),
+    Compartment = factor(as.character(Compartment), levels = c("BR", "BS"))
+  ) %>%
+  arrange(Host_species, Compartment,
+          suppressWarnings(as.numeric(Plant_replicate)),
+          Plant_replicate, SampleID_join)
+
+soil_cells <- table(soil_depth$Host_species, soil_depth$Compartment)
+if (any(soil_cells == 0)) {
+  stop("A host is missing BR or BS samples in the LSU soil-only figure.")
+}
+
+soil_depth <- soil_depth %>%
+  mutate(Sample_x = factor(SampleID_join, levels = SampleID_join))
+soil_long <- group_long %>%
+  filter(SampleID_join %in% soil_depth$SampleID_join) %>%
+  mutate(
+    Host_species = factor(Host_species, levels = soil_hosts),
+    Sample_x = factor(SampleID_join, levels = levels(soil_depth$Sample_x))
+  )
+
+soil_bar_sums <- soil_long %>%
+  group_by(SampleID_join) %>%
+  summarise(Share = sum(Relative_abundance), .groups = "drop")
+if (nrow(soil_bar_sums) != nrow(soil_depth) ||
+    any(abs(soil_bar_sums$Share - 1) > 1e-10)) {
+  stop("The LSU soil-only bars do not each sum to 100% of all LSU reads.")
+}
+
+soil_labels <- setNames(
+  paste0(ifelse(soil_depth$Compartment == "BR", "Soil with roots",
+                "Soil without roots"), "\nR", soil_depth$Plant_replicate),
+  soil_depth$SampleID_join
+)
+used_soil_groups <- names(group_colors)[names(group_colors) %in%
+                                         unique(as.character(soil_long$Fungal_group))]
+
+p_soil_br_bs <- ggplot(soil_long %>% filter(Reads > 0),
+                       aes(x = Sample_x, y = Relative_abundance,
+                           fill = Fungal_group)) +
+  geom_col(colour = "black", linewidth = 0.1) +
+  facet_grid(. ~ Host_species, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = group_colors, breaks = used_soil_groups,
+                    drop = TRUE, name = "LSU phylum / unresolved") +
+  guides(fill = guide_legend(ncol = 4, byrow = TRUE)) +
+  scale_x_discrete(labels = function(x) unname(soil_labels[x])) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0))) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    title = "LSU fungal phyla in soil with and without roots",
+    x = NULL,
+    y = "Relative abundance of all non-chimeric LSU reads",
+    caption = paste(
+      "BR and BS are independent biological samples, not paired subsamples.",
+      "V18 validates AMF; EUKARYOME supplies other fungal phyla.",
+      "Unresolved reads remain in the denominator."
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+    strip.text = element_text(size = 9),
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    plot.caption = element_text(size = 7, hjust = 0)
+  )
+
+soil_plot_file <- Sys.getenv("LSU_SOIL_PDF", unset = "")
+if (!nzchar(soil_plot_file)) {
+  soil_plot_file <- file.path(out_path, "figures",
+                              "LSU_all_reads_reconciled_soil_BR_BS_phylum.pdf")
+}
+ggsave(soil_plot_file, p_soil_br_bs, width = 14, height = 6.2,
+       units = "in", device = grDevices::pdf, useDingbats = FALSE)
+if (!file.exists(soil_plot_file) || file.info(soil_plot_file)$size == 0) {
+  stop("PDF export failed: ", soil_plot_file)
+}
+cat("Wrote:", soil_plot_file, "\n")
+list(soil_plot = p_soil_br_bs)
+})
+```
+
+# Soil phylum comparison across markers
+
+```{r soil-phylum-three-markers, fig.width=24, fig.height=9}
+p_soil_three <- patchwork::wrap_plots(
+  paper_illumina[["16S"]]$soil_plot,
+  paper_illumina[["ITS"]]$soil_plot,
+  paper_lsu$soil_plot + labs(title = "LSU", y = "Relative abundance (%)", caption = NULL) +
+    guides(fill = guide_legend(ncol = 2)) + theme(legend.text = element_text(size = 7)), nrow = 1)
+print(p_soil_three)
+ggsave(file.path(paper_out, "ALL_phylum_soil_only.pdf"), p_soil_three,
+  width = 24, height = 9, limitsize = FALSE)
+```
+
+# AMF family composition
+
+```{r amf-positive, fig.width=18, fig.height=8.5}
+local({
+amf_rds <- paper_input("lsu_amf")
+plot_dir <- section_out("AMF")
+ps_amf_all <- readRDS(amf_rds)
+if (!inherits(ps_amf_all, "phyloseq")) stop("Expected a phyloseq object.")
+
+otu <- as(otu_table(ps_amf_all), "matrix")
+if (taxa_are_rows(ps_amf_all)) otu <- t(otu)
+metadata <- as(sample_data(ps_amf_all), "data.frame") %>%
+  rownames_to_column("SampleID_join")
+taxonomy <- as(tax_table(ps_amf_all), "matrix")
+
+if (!setequal(rownames(otu), metadata$SampleID_join) ||
+    !setequal(colnames(otu), rownames(taxonomy))) {
+  stop("Sample or ASV identifiers do not match across count, metadata, and taxonomy tables.")
+}
+if (!all(c("Host_species", "Compartment", "Plant_replicate") %in% names(metadata))) {
+  stop("Required host, compartment, or replicate metadata is missing.")
+}
+if (anyNA(otu) || any(otu < 0) || any(otu != round(otu))) {
+  stop("ASV table must contain non-negative integer counts with no missing values.")
+}
+
+family <- taxonomy[colnames(otu), "Family"]
+family[is.na(family) | family == ""] <- "Unclassified_Glomeromycota"
+family_counts <- t(rowsum(t(otu), group = family, reorder = TRUE))
+stopifnot(identical(unname(rowSums(family_counts)), unname(rowSums(otu))))
+
+family_colors <- c(
+  "Acaulosporaceae" = "#E5D78B",
+  "Ambisporaceae" = "#4F8DA8",
+  "Archaeosporaceae" = "#A64924",
+  "Glomeraceae" = "#68C34A",
+  "Sclerocystaceae_Kamienskiaceae" = "#B7DDF0",
+  "Unclassified_Glomeromycota" = "#B5B5B5"
+)
+if (!all(colnames(family_counts) %in% names(family_colors))) {
+  stop("New V18 family/clade label found; review the palette before plotting: ",
+       paste(setdiff(colnames(family_counts), names(family_colors)), collapse = ", "))
+}
+
+part_order <- c("BR", "BS", "SP", "Rh", "root", "stolon", "BG", "AG", "leaf")
+part_names <- c(
+  BR = "BR", BS = "BS", SP = "SP", Rh = "Rhizosphere",
+  root = "Root endosphere", stolon = "Stolon endosphere",
+  BG = "BG", AG = "AG", leaf = "Leaf endosphere"
+)
+if (!all(as.character(metadata$Compartment) %in% part_order)) {
+  stop("Unrecognized compartment; update part_order and part_names before plotting.")
+}
+
+sample_depth <- metadata %>%
+  transmute(
+    SampleID_join,
+    Host_species = as.character(Host_species),
+    Compartment = factor(as.character(Compartment), levels = part_order),
+    Plant_replicate = as.character(Plant_replicate),
+    AMF_reads = unname(rowSums(family_counts)[SampleID_join])
+  ) %>%
+  arrange(Host_species, Compartment, suppressWarnings(as.numeric(Plant_replicate)),
+          Plant_replicate, SampleID_join)
+
+if (anyNA(sample_depth$AMF_reads) || anyNA(sample_depth$Compartment)) {
+  stop("AMF depth or compartment could not be matched for every sample.")
+}
+
+family_long <- as.data.frame(family_counts) %>%
+  rownames_to_column("SampleID_join") %>%
+  pivot_longer(-SampleID_join, names_to = "Family", values_to = "Family_reads") %>%
+  left_join(sample_depth, by = "SampleID_join", relationship = "many-to-one") %>%
+  mutate(
+    Relative_abundance = if_else(AMF_reads > 0, Family_reads / AMF_reads, NA_real_),
+    Family = factor(Family, levels = names(family_colors))
+  )
+
+if (anyNA(family_long$Family) ||
+    any(abs(rowSums(family_counts) - sample_depth$AMF_reads[
+      match(rownames(family_counts), sample_depth$SampleID_join)]) > 0)) {
+  stop("Family counts did not reconcile with sample totals.")
+}
+
+write.csv(
+  family_long %>% select(SampleID_join, Host_species, Compartment,
+                         Plant_replicate, AMF_reads, Family, Family_reads,
+                         Relative_abundance),
+  file.path(plot_dir, "LSU_AMF_per_host_family_relative_abundance.csv"),
+  row.names = FALSE
+)
+
+sample_depth %>%
+  group_by(Host_species, Compartment) %>%
+  summarise(samples = n(), AMF_positive = sum(AMF_reads > 0),
+            min_positive_reads = if (any(AMF_reads > 0)) min(AMF_reads[AMF_reads > 0])
+                                 else NA_real_, .groups = "drop") %>%
+  knitr::kable(caption = "AMF detections by host and compartment")
+host_order <- c("Calamagrostis", "Chusquea", "Espeletia",
+                "Oreobolus", "Oritrophium", "Racomitrium")
+full_compartment_names <- c(
+  BR = "Soil with roots", BS = "Soil without roots",
+  SP = "Stolonosphere", Rh = "Rhizosphere",
+  root = "Root endosphere", stolon = "Stolon endosphere",
+  BG = "Belowground endosphere", AG = "Aboveground endosphere",
+  leaf = "Leaf endosphere"
+)
+positive_depth <- sample_depth %>%
+  filter(AMF_reads > 0) %>%
+  mutate(Host_species = factor(Host_species, levels = host_order)) %>%
+  arrange(Host_species, Compartment,
+          suppressWarnings(as.numeric(Plant_replicate)),
+          Plant_replicate, SampleID_join)
+if (anyNA(positive_depth$Host_species) ||
+    !setequal(as.character(unique(positive_depth$Host_species)), host_order)) {
+  stop("Review host labels before making the combined AMF plot.")
+}
+positive_depth$Sample_x <- seq_len(nrow(positive_depth)) +
+  as.integer(positive_depth$Host_species) - 1L
+positive_family <- family_long %>%
+  inner_join(positive_depth %>% select(SampleID_join, Sample_x),
+             by = "SampleID_join", relationship = "many-to-one") %>%
+  filter(Family_reads > 0)
+if (!setequal(unique(positive_family$SampleID_join),
+              positive_depth$SampleID_join) ||
+    any(abs(positive_family %>%
+              group_by(SampleID_join) %>%
+              summarise(Total = sum(Relative_abundance), .groups = "drop") %>%
+              pull(Total) - 1) > 1e-10)) {
+  stop("Positive AMF family proportions do not sum to one per sample.")
+}
+host_centers <- positive_depth %>%
+  group_by(Host_species) %>%
+  summarise(Sample_x = mean(range(Sample_x)), .groups = "drop")
+host_edges <- positive_depth %>%
+  group_by(Host_species) %>%
+  summarise(Last_x = max(Sample_x), .groups = "drop") %>%
+  slice_head(n = length(host_order) - 1L) %>%
+  mutate(Separator_x = Last_x + 1)
+detected_families <- names(family_colors)[
+  names(family_colors) %in% as.character(unique(positive_family$Family))
+]
+
+p_combined_amf <- ggplot(positive_family,
+                         aes(x = Sample_x, y = Relative_abundance,
+                             fill = Family)) +
+  geom_col(width = 0.86, colour = "white", linewidth = 0.15) +
+  geom_vline(data = host_edges, aes(xintercept = Separator_x),
+             inherit.aes = FALSE, colour = "grey75", linewidth = 0.45) +
+  geom_text(data = positive_depth,
+            aes(x = Sample_x, y = 1.045, label = AMF_reads),
+            inherit.aes = FALSE, size = 2.5) +
+  geom_text(data = host_centers,
+            aes(x = Sample_x, y = 1.19, label = Host_species),
+            inherit.aes = FALSE, fontface = "bold", size = 3.5) +
+  scale_fill_manual(values = family_colors, breaks = detected_families,
+                    drop = TRUE, name = "V18 AMF family/clade") +
+  scale_x_continuous(
+    breaks = positive_depth$Sample_x,
+    labels = paste0(full_compartment_names[
+      as.character(positive_depth$Compartment)],
+      " R", positive_depth$Plant_replicate),
+    expand = expansion(add = 0.55)
+  ) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0))) +
+  coord_cartesian(ylim = c(0, 1.25), clip = "off") +
+  labs(
+    title = "Validated AMF family composition across hosts",
+    subtitle = paste(nrow(positive_depth), "AMF-positive samples;",
+                     nrow(sample_depth) - nrow(positive_depth),
+                     "samples with no validated AMF reads omitted"),
+    x = "Compartment and plant replicate", y = "Share of validated AMF reads",
+    caption = paste("Numbers above bars = validated AMF reads per sample.",
+                    "Colors show the composition within those reads, not",
+                    "the share of all LSU reads.")
+  ) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", colour = "#A6192E"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5,
+                                   size = 7),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "bottom",
+        plot.caption = element_text(size = 8, hjust = 0),
+        plot.margin = margin(10, 10, 10, 10))
+print(p_combined_amf)
+combined_amf_file <- file.path(
+  plot_dir, "LSU_AMF_family_relative_abundance_all_hosts_positive.pdf")
+ggsave(combined_amf_file, p_combined_amf, width = 18, height = 8.5,
+       units = "in", device = grDevices::pdf, useDingbats = FALSE)
+if (!file.exists(combined_amf_file) || file.info(combined_amf_file)$size == 0) {
+  stop("Combined AMF PDF export failed: ", combined_amf_file)
+}
+cat("Wrote:", combined_amf_file, "\n")
+})
+```
+
+# LSU fungal dbRDA
+
+The displayed additive model uses EUKARYOME fungal proportions and square-root Bray–Curtis distances. The habitat test conditions on plant identity and restricts permutations within plants. BH adjustment leaves this single-test p-value unchanged.
+
+```{r lsu-dbrda, fig.width=11, fig.height=8}
+local({
+count_file <- paper_input("lsu_counts")
+metadata_file <- paper_input("lsu_meta")
+taxonomy_file <- paper_input("lsu_euk")
+output_dir <- section_out("LSU_dbRDA")
+counts <- readRDS(count_file)
+meta <- read.csv(metadata_file, fileEncoding = "UTF-8-BOM",
+                 check.names = FALSE, stringsAsFactors = FALSE)
+tax <- read.delim(taxonomy_file, check.names = FALSE,
+                  stringsAsFactors = FALSE)
+if (!is.matrix(counts) || !is.numeric(counts) || anyNA(counts) ||
+    any(counts < 0) || anyDuplicated(rownames(counts)) ||
+    anyDuplicated(colnames(counts))) {
+  stop("LSU count table is invalid or has duplicate sample/sequence IDs.")
+}
+if (!all(c("SampleID", "Host_species", "Plant_replicate",
+           "Shortened_description", "Ecosite") %in% names(meta)) ||
+    anyDuplicated(meta$SampleID) || !all(rownames(counts) %in% meta$SampleID)) {
+  stop("LSU sample IDs and metadata do not match uniquely.")
+}
+if (!all(c("Kingdom", "Phylum") %in% names(tax)) ||
+    !any(c("Sequence", "ASV_ID") %in% names(tax))) {
+  stop("EUKARYOME taxonomy needs a sequence, Kingdom, and Phylum column.")
+}
+tax$Sequence_key <- if ("Sequence" %in% names(tax))
+  toupper(as.character(tax$Sequence)) else toupper(as.character(tax$ASV_ID))
+if (anyNA(tax$Sequence_key) || anyDuplicated(tax$Sequence_key)) {
+  stop("Duplicate or missing EUKARYOME nucleotide sequences.")
+}
+
+meta <- meta[match(rownames(counts), meta$SampleID), , drop = FALSE]
+tax_index <- match(toupper(colnames(counts)), tax$Sequence_key)
+fungal <- !is.na(tax_index) & tax$Kingdom[tax_index] == "Fungi"
+fungal[is.na(fungal)] <- FALSE
+fungal_counts <- counts[, fungal, drop = FALSE]
+fungal_counts <- fungal_counts[, colSums(fungal_counts) > 0, drop = FALSE]
+if (!ncol(fungal_counts) || any(rowSums(fungal_counts) == 0)) {
+  stop("At least one sample has no EUKARYOME-assigned fungal LSU reads.")
+}
+
+meta$Host_species <- factor(trimws(meta$Host_species))
+meta$Compartment <- factor(
+  trimws(meta$Shortened_description),
+  levels = c("BR", "BS", "Rh", "SP", "root", "stolon", "BG", "AG", "leaf")
+)
+meta$Plant_replicate <- as.character(meta$Plant_replicate)
+meta$Ecosite <- factor(trimws(meta$Ecosite))
+meta$Habitat_group <- case_when(
+  meta$Compartment %in% c("BR", "BS") ~ "Bulk_Soil",
+  meta$Compartment %in% c("Rh", "SP") ~ "Rhizosphere",
+  meta$Compartment %in% c("root", "stolon", "BG") ~ "Endosphere",
+  meta$Compartment %in% c("AG", "leaf") ~ "Aboveground",
+  TRUE ~ NA_character_
+)
+if (anyNA(meta$Habitat_group) || anyNA(meta$Host_species) ||
+    anyNA(meta$Plant_replicate) || anyNA(meta$Ecosite)) {
+  stop("Missing/unrecognized host, compartment, replicate, or ecosite.")
+}
+meta$Habitat_group <- factor(
+  meta$Habitat_group,
+  levels = c("Bulk_Soil", "Rhizosphere", "Endosphere", "Aboveground")
+)
+
+qc <- data.frame(
+  SampleID = rownames(counts),
+  Host_species = as.character(meta$Host_species),
+  Compartment = as.character(meta$Compartment),
+  Ecosite = as.character(meta$Ecosite),
+  All_LSU_reads = rowSums(counts),
+  EUK_exact_match_reads = rowSums(counts[, !is.na(tax_index), drop = FALSE]),
+  EUK_fungal_reads = rowSums(fungal_counts)
+)
+qc$EUK_exact_match_fraction <- qc$EUK_exact_match_reads / qc$All_LSU_reads
+qc$EUK_fungal_fraction <- qc$EUK_fungal_reads / qc$All_LSU_reads
+write.csv(qc, file.path(output_dir, "LSU_EUKARYOME_dbRDA_read_QC.csv"),
+          row.names = FALSE)
+cat(nrow(counts), "samples;", ncol(counts), "LSU ASVs;",
+    ncol(fungal_counts), "EUKARYOME fungal ASVs.\n")
+cat("Exact taxonomy match:",
+    scales::percent(sum(qc$EUK_exact_match_reads) / sum(qc$All_LSU_reads),
+                    accuracy = 0.01), "of LSU reads.\n")
+cat("EUKARYOME fungal assignments:",
+    scales::percent(sum(qc$EUK_fungal_reads) / sum(qc$All_LSU_reads),
+                    accuracy = 0.01), "of LSU reads.\n")
+print(with(meta, table(Host_species, Compartment)))
+print(with(meta, table(Ecosite, Host_species)))
+
+# Normalize within each fungal library; do not rarefy relative-abundance dbRDA.
+fungal_rel <- sweep(fungal_counts, 1, rowSums(fungal_counts), "/")
+# The restricted test asks about habitat differences within plants, not host
+# differences among field sites. It is separate from the displayed joint model.
+test_habitat_within_plant <- function(community, metadata) {
+  design <- metadata
+  design$PlantID <- interaction(design$Host_species,
+                                design$Plant_replicate, drop = TRUE)
+  informative <- tapply(
+    as.character(design$Habitat_group), design$PlantID,
+    function(x) length(unique(x)) >= 2L
+  )
+  keep <- as.character(design$PlantID) %in% names(informative)[informative]
+  if (sum(keep) < 4L || sum(informative) < 2L) {
+    stop("Too few plant replicates have multiple habitat groups for a within-plant test.")
+  }
+  community <- community[keep, , drop = FALSE]
+  community <- community[, colSums(community) > 0, drop = FALSE]
+  design <- droplevels(design[keep, , drop = FALSE])
+  partial_model <- vegan::dbrda(
+    community ~ Habitat_group + Condition(PlantID),
+    data = design, distance = "bray", sqrt.dist = TRUE
+  )
+  restricted <- permute::how(
+    nperm = 999, blocks = design$PlantID,
+    within = permute::Within(type = "free")
+  )
+  set.seed(20260930)
+  result <- as.data.frame(vegan::anova.cca(
+    partial_model, permutations = restricted
+  ))
+  list(
+    N_samples_test = nrow(design),
+    N_plants = nlevels(design$PlantID),
+    Df = result["Model", "Df"],
+    F = result["Model", "F"],
+    P = result["Model", "Pr(>F)"]
+  )
+}
+all_model <- vegan::dbrda(
+  fungal_rel ~ Host_species + Habitat_group,
+  data = meta, distance = "bray", sqrt.dist = TRUE
+)
+all_r2 <- vegan::RsquareAdj(all_model)
+all_scores <- as.data.frame(vegan::scores(
+  all_model, display = "sites", choices = 1:2, scaling = 1
+))
+if (ncol(all_scores) < 2 || length(all_model$CCA$eig) < 2) {
+  stop("The all-sample model has fewer than two constrained axes.")
+}
+names(all_scores)[1:2] <- c("dbRDA1", "dbRDA2")
+all_scores <- cbind(meta[, c("SampleID", "Host_species", "Compartment",
+                             "Habitat_group", "Ecosite")], all_scores)
+write.csv(all_scores, file.path(output_dir, "LSU_EUKARYOME_dbRDA_all_scores.csv"),
+          row.names = FALSE)
+all_pct <- 100 * all_model$CCA$eig[1:2] / all_model$tot.chi
+all_habitat_test <- test_habitat_within_plant(fungal_rel, meta)
+
+model_summary <- data.frame(
+  Analysis = "All samples: host + broad habitat",
+  N_samples = nrow(meta),
+  N_fungal_ASVs = ncol(fungal_rel),
+  Constrained_fraction = all_model$CCA$tot.chi / all_model$tot.chi,
+  Adjusted_R2 = all_r2$adj.r.squared,
+  Axis1_percent_total = all_pct[1],
+  Axis2_percent_total = all_pct[2]
+)
+print(model_summary)
+# Match the ITS/16S broad-compartment palette and host symbols.
+compartment_pal <- c(
+  Bulk_Soil = "#8B4513", Rhizosphere = "#FFD700",
+  Endosphere = "#228B22", Aboveground = "#87CEEB"
+)
+host_colors <- c(
+  Calamagrostis = "#FF7F00", Chusquea = "#4DAF4A",
+  Espeletia = "#E41A1C", Oreobolus = "#A65628",
+  Oritrophium = "#377EB8", Racomitrium = "#984EA3"
+)
+host_shapes <- c(
+  Calamagrostis = 16, Chusquea = 17, Espeletia = 15,
+  Oreobolus = 3, Oritrophium = 7, Racomitrium = 8
+)
+
+# A categorical term has no continuous slope. These arrows point to the
+# observed group centroids, not to fitted environmental gradients.
+make_centroid_arrows <- function(site_table, group_column, label_prefix) {
+  site_table %>%
+    group_by(.data[[group_column]]) %>%
+    summarise(dbRDA1 = mean(dbRDA1), dbRDA2 = mean(dbRDA2),
+              .groups = "drop") %>%
+    rename(Group = all_of(group_column)) %>%
+    mutate(Label = paste0(label_prefix, gsub("_", " ", Group)))
+}
+all_arrows <- bind_rows(
+  make_centroid_arrows(all_scores, "Habitat_group", "Habitat: "),
+  make_centroid_arrows(all_scores, "Host_species", "Host: ")
+)
+p_all <- ggplot(all_scores,
+                aes(dbRDA1, dbRDA2, color = Habitat_group,
+                    shape = Host_species)) +
+  geom_segment(data = all_arrows,
+               aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2),
+               inherit.aes = FALSE, color = "black", linewidth = 0.4,
+               arrow = grid::arrow(length = grid::unit(0.17, "cm"))) +
+  geom_point(size = 2.8, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = all_arrows, aes(dbRDA1, dbRDA2, label = Label),
+    inherit.aes = FALSE, color = "black", size = 3,
+    box.padding = 0.3, point.padding = 0.2, force = 2,
+    max.overlaps = Inf, max.time = 2, seed = 20260930
+  ) +
+  scale_color_manual(values = compartment_pal,
+                     labels = c(Bulk_Soil = "Bulk soil",
+                                Rhizosphere = "Rhizosphere",
+                                Endosphere = "Endosphere",
+                                Aboveground = "Aboveground")) +
+  scale_shape_manual(values = host_shapes) +
+  labs(
+    title = "dbRDA (LSU): compartment + host species",
+    subtitle = sprintf(
+      "EUKARYOME fungal ASVs; n = %d; adjusted R² = %.3f; within-plant habitat p = %.3f",
+      nrow(all_scores), all_r2$adj.r.squared, all_habitat_test$P
+    ),
+    x = sprintf("dbRDA 1 (%.1f%% of total variation)", all_pct[1]),
+    y = sprintf("dbRDA 2 (%.1f%% of total variation)", all_pct[2]),
+    color = "Broad compartment", shape = "Host species",
+    caption = paste0(
+      "Arrows show group centroids.\n",
+      "Host, site, and sampled organs are partly confounded."
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right", plot.caption = element_text(size = 8))
+print(p_all)
+ggsave(file.path(output_dir, "LSU_EUKARYOME_dbRDA_all_samples.pdf"),
+       p_all, width = 11, height = 8)
+
+model_summary$Raw_p_value <- all_habitat_test$P
+model_summary$BH_adjusted_p_value <- all_habitat_test$P
+model_summary$Adjustment_family <- "Single prespecified LSU within-plant habitat test"
+model_summary$Pseudo_F <- all_habitat_test$F
+model_summary$Df <- all_habitat_test$Df
+write.csv(model_summary, file.path(output_dir, "LSU_dbRDA_model_and_test.csv"), row.names = FALSE)
+print(model_summary)
+})
+```
+
+# Matched specimens and amplicon comparisons
+
+The alpha figure follows the original marker-specific rarefaction depths. PROTEST tests two-dimensional ordination concordance. Aligned axes have no single PCoA percentage after rotation. The BS–BR test family contains three marker tests with BH adjustment.
+
+```{r paired-marker-figures, fig.width=17, fig.height=10}
+local({
+output_dir <- section_out("marker_comparison")
+its_count_file <- paper_input("its_counts")
+its_tax_file <- paper_input("its_tax_csv")
+its_metadata_file <- paper_input("its_meta")
+lsu_count_file <- paper_input("lsu_counts")
+lsu_tax_file <- paper_input("lsu_euk")
+v18_file <- paper_input("lsu_v18")
+lsu_metadata_file <- paper_input("lsu_meta")
+compartment_order <- c("BR", "BS", "Rh", "root", "SP", "stolon", "BG", "AG", "leaf")
+host_pal <- c(Espeletia = "#E41A1C", Oritrophium = "#377EB8", Chusquea = "#4DAF4A",
+  Racomitrium = "#984EA3", Calamagrostis = "#FF7F00", Oreobolus = "#A65628")
+its_counts <- as.matrix(read.csv(
+  its_count_file, row.names = 1, check.names = FALSE
+))
+storage.mode(its_counts) <- "numeric"
+its_tax <- read.csv(its_tax_file, row.names = 1, check.names = FALSE)
+its_meta <- read.delim(its_metadata_file, check.names = FALSE)
+
+lsu_counts <- readRDS(lsu_count_file)
+lsu_tax <- read.delim(lsu_tax_file, check.names = FALSE)
+v18 <- read.delim(v18_file, check.names = FALSE)
+lsu_meta <- read.csv(
+  lsu_metadata_file, check.names = FALSE, fileEncoding = "UTF-8-BOM"
+)
+if (!all(c("Kingdom", "Phylum") %in% names(lsu_tax)) ||
+    !all(c("Sequence", "phylum") %in% names(v18)) ||
+    !any(c("Sequence", "ASV_ID") %in% names(lsu_tax))) {
+  stop("LSU taxonomy or V18 placement columns are not as expected.")
+}
+lsu_tax$Sequence_key <- if ("Sequence" %in% names(lsu_tax))
+  as.character(lsu_tax$Sequence) else as.character(lsu_tax$ASV_ID)
+
+if (!is.matrix(lsu_counts) || !is.numeric(lsu_counts) ||
+    anyNA(lsu_counts) || any(lsu_counts < 0) ||
+    anyNA(its_counts) || any(its_counts < 0)) {
+  stop("Both ASV tables must contain non-negative numeric counts without missing values.")
+}
+if (anyDuplicated(rownames(its_counts)) || anyDuplicated(colnames(its_counts)) ||
+    anyDuplicated(rownames(lsu_counts)) || anyDuplicated(colnames(lsu_counts)) ||
+    anyDuplicated(its_meta$sample.id) || anyDuplicated(lsu_meta$SampleID) ||
+    anyDuplicated(its_meta$Sample_name) || anyDuplicated(lsu_meta$Sample_name) ||
+    anyDuplicated(lsu_tax$Sequence_key) || anyDuplicated(v18$Sequence)) {
+  stop("Duplicate specimen, sample, sequence, or ASV identifiers need review.")
+}
+if (!all(colnames(its_counts) %in% its_meta$sample.id) ||
+    !all(rownames(lsu_counts) %in% lsu_meta$SampleID) ||
+    !all(rownames(its_counts) %in% rownames(its_tax))) {
+  stop("One of the ASV tables does not match its metadata or taxonomy table.")
+}
+if (!all(its_tax[rownames(its_counts), "Kingdom"] == "Fungi")) {
+  stop("The saved ITS table is not entirely fungal; review the ITS filtering step.")
+}
+cat("ITS:", nrow(its_counts), "ASVs and", ncol(its_counts), "samples.\n")
+cat("LSU:", ncol(lsu_counts), "ASVs and", nrow(lsu_counts), "samples.\n")
+its_meta_kept <- its_meta[match(colnames(its_counts), its_meta$sample.id), ]
+lsu_meta_kept <- lsu_meta[match(rownames(lsu_counts), lsu_meta$SampleID), ]
+specimen_key <- function(x) {
+  paste(trimws(x$Host_species), trimws(as.character(x$Plant_replicate)),
+        trimws(x$Shortened_description), sep = "|")
+}
+its_meta_kept$Biological_key <- specimen_key(its_meta_kept)
+lsu_meta_kept$Biological_key <- specimen_key(lsu_meta_kept)
+if (anyDuplicated(its_meta_kept$Biological_key) ||
+    anyDuplicated(lsu_meta_kept$Biological_key)) {
+  stop("Host + plant replicate + compartment does not identify specimens uniquely.")
+}
+paired_keys <- intersect(its_meta_kept$Biological_key,
+                         lsu_meta_kept$Biological_key)
+if (length(paired_keys) < 4L) stop("Too few paired ITS–LSU specimens.")
+its_idx <- match(paired_keys, its_meta_kept$Biological_key)
+lsu_idx <- match(paired_keys, lsu_meta_kept$Biological_key)
+
+paired_meta <- data.frame(
+  Biological_key = paired_keys,
+  Sample_name = lsu_meta_kept$Sample_name[lsu_idx],
+  ITS_Sample_name = its_meta_kept$Sample_name[its_idx],
+  ITS_sample_id = its_meta_kept$sample.id[its_idx],
+  LSU_sample_id = lsu_meta_kept$SampleID[lsu_idx],
+  Host_species = lsu_meta_kept$Host_species[lsu_idx],
+  Plant_replicate = lsu_meta_kept$Plant_replicate[lsu_idx],
+  Compartment = lsu_meta_kept$Shortened_description[lsu_idx],
+  stringsAsFactors = FALSE
+)
+paired_meta <- paired_meta[order(paired_meta$Sample_name), ]
+paired_names <- paired_meta$Sample_name
+if (anyNA(paired_meta) || anyDuplicated(paired_names))
+  stop("Paired specimen metadata is missing or duplicated.")
+
+its_paired <- t(its_counts[, paired_meta$ITS_sample_id, drop = FALSE])
+lsu_paired <- lsu_counts[paired_meta$LSU_sample_id, , drop = FALSE]
+rownames(its_paired) <- rownames(lsu_paired) <- paired_meta$Sample_name
+its_paired <- its_paired[, colSums(its_paired) > 0, drop = FALSE]
+
+inclusion <- full_join(
+  its_meta_kept %>%
+    transmute(Biological_key, ITS_Sample_name = Sample_name,
+              ITS_retained = TRUE),
+  lsu_meta_kept %>%
+    transmute(Biological_key, LSU_Sample_name = Sample_name,
+              LSU_retained = TRUE),
+  by = "Biological_key"
+) %>%
+  mutate(across(c(ITS_retained, LSU_retained), ~replace_na(.x, FALSE))) %>%
+  arrange(Biological_key)
+write.csv(inclusion, file.path(output_dir, "ITS_LSU_sample_inclusion.csv"),
+          row.names = FALSE)
+write.csv(paired_meta, file.path(output_dir, "ITS_LSU_paired_metadata.csv"),
+          row.names = FALSE)
+
+cat(length(paired_names), "biological specimens occur in both retained tables.\n")
+label_disagreements <- paired_meta %>%
+  filter(Sample_name != ITS_Sample_name) %>%
+  select(Biological_key, ITS_Sample_name, LSU_Sample_name = Sample_name)
+if (nrow(label_disagreements)) {
+  cat("Specimen label differences between source metadata files:\n")
+  print(label_disagreements)
+}
+print(with(paired_meta, table(Host_species, Compartment)))
+# The earlier query used sequences as FASTA identifiers; a newer ASV-ID export
+# has a separate Sequence column. Either way, join by exact nucleotide sequence.
+euk_match <- match(colnames(lsu_paired), lsu_tax$Sequence_key)
+v18_match <- match(colnames(lsu_paired), v18$Sequence)
+euk_kingdom <- lsu_tax$Kingdom[euk_match]
+euk_phylum <- lsu_tax$Phylum[euk_match]
+v18_validated <- !is.na(v18_match) &
+  v18$phylum[v18_match] == "Glomeromycota"
+v18_validated[is.na(v18_validated)] <- FALSE
+lsu_fungal <- (!is.na(euk_kingdom) & euk_kingdom == "Fungi") |
+  v18_validated
+lsu_fungal[is.na(lsu_fungal)] <- FALSE
+
+lsu_phylum <- euk_phylum
+lsu_phylum[v18_validated] <- "Glomeromycota"
+lsu_phylum[is.na(lsu_phylum) | lsu_phylum == ""] <-
+  "Fungi; phylum unresolved"
+lsu_fungal_counts <- lsu_paired[, lsu_fungal, drop = FALSE]
+lsu_fungal_counts <- lsu_fungal_counts[
+  , colSums(lsu_fungal_counts) > 0, drop = FALSE
+]
+if (ncol(lsu_fungal_counts) == 0 || any(rowSums(lsu_fungal_counts) == 0)) {
+  stop("At least one paired specimen has no classified fungal LSU reads.")
+}
+
+lsu_qc <- paired_meta %>%
+  mutate(
+    LSU_all_reads = rowSums(lsu_paired),
+    LSU_EUK_exact_match_reads = rowSums(
+      lsu_paired[, !is.na(euk_match), drop = FALSE]
+    ),
+    LSU_fungal_reads = rowSums(lsu_fungal_counts),
+    LSU_unmatched_fraction = 1 - LSU_EUK_exact_match_reads / LSU_all_reads,
+    LSU_fungal_fraction = LSU_fungal_reads / LSU_all_reads
+  )
+write.csv(lsu_qc, file.path(output_dir, "ITS_LSU_paired_depth_QC.csv"),
+          row.names = FALSE)
+
+cat("EUKARYOME exact-sequence coverage:", sum(!is.na(euk_match)), "of",
+    ncol(lsu_paired), "LSU ASVs and",
+    scales::percent(sum(lsu_qc$LSU_EUK_exact_match_reads) /
+                      sum(lsu_qc$LSU_all_reads), accuracy = 0.1),
+    "of paired LSU reads.\n")
+cat("Fungal-only LSU fraction across paired specimens:",
+    scales::percent(sum(lsu_qc$LSU_fungal_reads) /
+                      sum(lsu_qc$LSU_all_reads), accuracy = 0.1), "\n")
+cat("Maximum per-specimen fraction without an exact EUKARYOME match:",
+    scales::percent(max(lsu_qc$LSU_unmatched_fraction), accuracy = 0.1), "\n")
+if (any(lsu_qc$LSU_unmatched_fraction > 0.05)) {
+  warning("Some specimens exceed 5% unmatched LSU reads; inspect the QC table before interpretation.")
+}
+if (any(its_paired != floor(its_paired)) ||
+    any(lsu_fungal_counts != floor(lsu_fungal_counts))) {
+  stop("Alpha-diversity rarefaction requires whole-number read counts.")
+}
+alpha_depth <- min(rowSums(its_paired), rowSums(lsu_fungal_counts))
+if (alpha_depth < 1000) {
+  stop("Minimum paired fungal depth is below 1,000 reads; review samples before rarefying.")
+}
+set.seed(20260924)
+its_alpha_counts <- vegan::rrarefy(its_paired, sample = alpha_depth)
+lsu_alpha_counts <- vegan::rrarefy(lsu_fungal_counts, sample = alpha_depth)
+
+alpha_metrics <- function(counts, marker) {
+  data.frame(
+    Sample_name = rownames(counts),
+    Marker = marker,
+    Fungal_reads_before_rarefaction = if (marker == "ITS")
+      rowSums(its_paired) else rowSums(lsu_fungal_counts),
+    Rarefaction_depth = alpha_depth,
+    Observed_ASVs = rowSums(counts > 0),
+    Shannon = vegan::diversity(counts, index = "shannon"),
+    row.names = NULL
+  )
+}
+alpha_table <- bind_rows(
+  alpha_metrics(its_alpha_counts, "ITS"),
+  alpha_metrics(lsu_alpha_counts, "LSU")
+) %>%
+  left_join(paired_meta %>%
+              select(Sample_name, Biological_key, Host_species, Compartment),
+            by = "Sample_name")
+if (anyNA(alpha_table) ||
+    !all(table(alpha_table$Sample_name) == 2L)) {
+  stop("Alpha-diversity table is not paired for every specimen.")
+}
+cat("Both markers rarefied to", alpha_depth,
+    "fungal reads per specimen;", length(paired_names),
+    "paired specimens retained.\n")
+write.csv(alpha_table,
+          file.path(output_dir, "ITS_LSU_paired_alpha_diversity.csv"),
+          row.names = FALSE)
+sixteen_count_file <- paper_input("s16_counts")
+sixteen_metadata_file <- paper_input("s16_meta_all")
+if (!all(file.exists(c(sixteen_count_file, sixteen_metadata_file)))) {
+  stop("Missing 16S count table or metadata for three-marker alpha plots.")
+}
+sixteen_counts_all <- as.matrix(read.csv(
+  sixteen_count_file, row.names = 1, check.names = FALSE
+))
+storage.mode(sixteen_counts_all) <- "numeric"
+sixteen_meta <- read.delim(sixteen_metadata_file, check.names = FALSE)
+needed_16s <- c("sample.id", "Host_species", "Plant_replicate",
+                "Shortened_description")
+if (!all(needed_16s %in% names(sixteen_meta)) ||
+    anyNA(sixteen_counts_all) || any(sixteen_counts_all < 0) ||
+    any(sixteen_counts_all != floor(sixteen_counts_all)) ||
+    anyDuplicated(colnames(sixteen_counts_all)) ||
+    anyDuplicated(sixteen_meta$sample.id)) {
+  stop("Review the 16S table or metadata before calculating alpha diversity.")
+}
+sixteen_meta$Biological_key <- specimen_key(sixteen_meta)
+if (anyDuplicated(sixteen_meta$Biological_key)) {
+  stop("16S host + replicate + plant part does not identify specimens uniquely.")
+}
+sixteen_idx <- match(paired_meta$Biological_key, sixteen_meta$Biological_key)
+if (anyNA(sixteen_idx)) {
+  stop("Some paired ITS–LSU specimens have no matching 16S metadata.")
+}
+sixteen_ids_all <- sixteen_meta$sample.id[sixteen_idx]
+three_marker_kept <- sixteen_ids_all %in% colnames(sixteen_counts_all)
+write.csv(
+  data.frame(Biological_key = paired_meta$Biological_key,
+             Sample_name = paired_meta$Sample_name,
+             SixteenS_sample_id = sixteen_ids_all,
+             Retained_in_three_marker_alpha = three_marker_kept),
+  file.path(output_dir, "16S_ITS_LSU_alpha_sample_inclusion.csv"),
+  row.names = FALSE
+)
+if (sum(three_marker_kept) < 4L) {
+  stop("Too few specimens are shared by the three filtered ASV tables.")
+}
+if (any(!three_marker_kept)) {
+  cat("Excluded from three-marker alpha plots (no filtered 16S table column):\n")
+  print(paired_meta[!three_marker_kept,
+                    c("Biological_key", "Sample_name"), drop = FALSE])
+}
+three_marker_meta <- paired_meta[three_marker_kept, , drop = FALSE]
+sixteen_ids <- sixteen_ids_all[three_marker_kept]
+sixteen_depth <- min(colSums(sixteen_counts_all))
+if (sixteen_depth < 10000) {
+  stop("Filtered 16S depth is below the 10,000-read threshold used in its notebook.")
+}
+sixteen_paired <- t(sixteen_counts_all[, sixteen_ids, drop = FALSE])
+rownames(sixteen_paired) <- three_marker_meta$Sample_name
+set.seed(42)
+sixteen_alpha_counts <- vegan::rrarefy(sixteen_paired,
+                                      sample = sixteen_depth)
+sixteen_alpha <- data.frame(
+  Sample_name = rownames(sixteen_alpha_counts),
+  Marker = "16S",
+  Fungal_reads_before_rarefaction = NA_real_,
+  Rarefaction_depth = sixteen_depth,
+  Observed_ASVs = rowSums(sixteen_alpha_counts > 0),
+  Shannon = vegan::diversity(sixteen_alpha_counts, index = "shannon"),
+  Host_species = three_marker_meta$Host_species,
+  Compartment = three_marker_meta$Compartment,
+  stringsAsFactors = FALSE
+)
+three_marker_alpha <- bind_rows(
+  sixteen_alpha %>% select(Sample_name, Marker, Rarefaction_depth,
+                          Observed_ASVs, Shannon, Host_species, Compartment),
+  alpha_table %>%
+    filter(Sample_name %in% three_marker_meta$Sample_name) %>%
+    select(Sample_name, Marker, Rarefaction_depth,
+           Observed_ASVs, Shannon, Host_species, Compartment)
+)
+three_marker_alpha$Marker <- factor(three_marker_alpha$Marker,
+                                    levels = c("16S", "ITS", "LSU"))
+three_marker_alpha$Compartment <- factor(
+  three_marker_alpha$Compartment, levels = compartment_order
+)
+if (anyNA(three_marker_alpha) ||
+    nrow(three_marker_alpha) != 3L * nrow(three_marker_meta) ||
+    !all(table(three_marker_alpha$Sample_name) == 3L)) {
+  stop("Three-marker alpha table is incomplete or not matched by specimen.")
+}
+write.csv(three_marker_alpha,
+          file.path(output_dir, "16S_ITS_LSU_paired_alpha_diversity.csv"),
+          row.names = FALSE)
+cat("Three-marker alpha plots:", nrow(three_marker_meta), "paired specimens;",
+    "16S depth", sixteen_depth, "reads; ITS/LSU depth", alpha_depth,
+    "fungal reads.\n")
+three_marker_colors <- c("16S" = "#3B7FB6", "ITS" = "#1B9E77",
+                         "LSU" = "#7570B3")
+make_three_marker_alpha_plot <- function(metric, y_label, title, filename) {
+  p <- ggplot(three_marker_alpha,
+              aes(x = Compartment, y = .data[[metric]])) +
+    geom_boxplot(aes(fill = Marker), width = 0.68, alpha = 0.35,
+                 outlier.shape = NA, na.rm = TRUE) +
+    geom_jitter(aes(color = Marker), width = 0.12, height = 0,
+                size = 1.25, alpha = 0.85, na.rm = TRUE) +
+    facet_grid(Marker ~ Host_species, scales = "free", space = "free_x") +
+    scale_fill_manual(values = three_marker_colors, guide = "none") +
+    scale_color_manual(values = three_marker_colors, guide = "none") +
+    labs(
+      title = title,
+      subtitle = paste0("Same paired specimens; 16S rarefied to ",
+                        sixteen_depth, " reads; ITS and LSU to ", alpha_depth,
+                        " fungal reads each"),
+      x = "Compartment or plant organ", y = y_label,
+      caption = paste("Each dot is one specimen. Y scales are marker-specific;",
+                      "observed ASV counts are not directly comparable across markers.")
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+          strip.text = element_text(size = 9))
+  print(p)
+  ggsave(file.path(output_dir, filename), p, width = 18, height = 10)
+  invisible(p)
+}
+
+p_three_marker_shannon <- make_three_marker_alpha_plot(
+  "Shannon", "Shannon diversity", "Alpha diversity by host and plant part",
+  "16S_ITS_LSU_Shannon_by_plant_part_boxplots.pdf"
+)
+soil_meta <- three_marker_meta %>%
+  filter(Compartment %in% c("BS", "BR")) %>%
+  mutate(
+    Soil_condition = factor(Compartment, levels = c("BS", "BR")),
+    PairID = interaction(Host_species, Plant_replicate, drop = TRUE)
+  )
+if (nrow(soil_meta) != 24L || nlevels(soil_meta$PairID) != 12L ||
+    any(table(soil_meta$PairID) != 2L) ||
+    any(vapply(split(as.character(soil_meta$Soil_condition), soil_meta$PairID),
+               function(x) !setequal(x, c("BS", "BR")), logical(1)))) {
+  stop("Expected 12 complete BS–BR pairs shared by all three filtered markers.")
+}
+write.csv(soil_meta, file.path(output_dir,
+                              "16S_ITS_LSU_paired_soil_samples.csv"),
+          row.names = FALSE)
+
+sixteen_soil_tax_file <- paper_input("s16_tax_csv")
+if (!file.exists(sixteen_soil_tax_file)) {
+  stop("Missing 16S taxonomy table for the paired soil figure.")
+}
+sixteen_soil_tax <- read.csv(sixteen_soil_tax_file, row.names = 1,
+                             check.names = FALSE)
+if (!all(colnames(sixteen_paired) %in% rownames(sixteen_soil_tax))) {
+  stop("Some 16S ASVs are missing from the saved taxonomy table.")
+}
+prokaryotic_soil_asvs <- sixteen_soil_tax[
+  colnames(sixteen_paired), "Kingdom"
+] %in% c("d__Bacteria", "d__Archaea")
+euk_soil_fungal_asvs <- !is.na(euk_kingdom) & euk_kingdom == "Fungi"
+euk_soil_fungal_asvs[is.na(euk_soil_fungal_asvs)] <- FALSE
+soil_counts <- list(
+  "16S" = sixteen_paired[soil_meta$Sample_name,
+                          prokaryotic_soil_asvs, drop = FALSE],
+  "ITS" = its_paired[soil_meta$Sample_name, , drop = FALSE],
+  "LSU" = lsu_paired[soil_meta$Sample_name,
+                      euk_soil_fungal_asvs, drop = FALSE]
+)
+if (any(vapply(soil_counts, function(x) !ncol(x) ||
+               any(rowSums(x) == 0) ||
+               !identical(rownames(x), soil_meta$Sample_name), logical(1)))) {
+  stop("A paired soil specimen has zero marker reads or mismatched sample IDs.")
+}
+
+soil_host_colors <- c(
+  Chusquea = "#4DAF4A", Espeletia = "#E41A1C",
+  Oritrophium = "#377EB8", Racomitrium = "#984EA3"
+)
+paired_permutations <- permute::allPerms(
+  nrow(soil_meta),
+  control = permute::how(
+    blocks = soil_meta$PairID,
+    within = permute::Within(type = "free")
+  )
+)
+if (nrow(paired_permutations) != 4095L) {
+  stop("Expected all 4,095 non-identity BS–BR label permutations.")
+}
+soil_scores_list <- list()
+soil_test_list <- list()
+for (marker in names(soil_counts)) {
+  marker_counts <- soil_counts[[marker]]
+  marker_counts <- marker_counts[,
+    colSums(marker_counts) > 0, drop = FALSE]
+  marker_rel <- sweep(marker_counts, 1, rowSums(marker_counts), "/")
+  soil_dist <- sqrt(vegan::vegdist(marker_rel, method = "bray"))
+  soil_pcoa <- vegan::wcmdscale(soil_dist, k = 2, eig = TRUE,
+                                add = "lingoes")
+  positive_eigenvalues <- soil_pcoa$eig[soil_pcoa$eig > 0]
+  if (length(positive_eigenvalues) < 2L ||
+      !is.matrix(soil_pcoa$points) || ncol(soil_pcoa$points) < 2L) {
+    stop("The ", marker, " paired-soil PCoA has fewer than two axes.")
+  }
+  axis_pct <- 100 * soil_pcoa$eig[1:2] / sum(positive_eigenvalues)
+  scores <- as.data.frame(soil_pcoa$points[, 1:2, drop = FALSE])
+  names(scores) <- c("PCoA1", "PCoA2")
+  soil_scores_list[[marker]] <- cbind(
+    soil_meta[, c("Sample_name", "Host_species", "Plant_replicate",
+                  "Compartment", "PairID", "Soil_condition")],
+    Marker = marker, scores,
+    PCoA1_percent = axis_pct[1], PCoA2_percent = axis_pct[2]
+  )
+
+  soil_model <- vegan::dbrda(
+    marker_rel ~ Soil_condition + Condition(PairID),
+    data = soil_meta, distance = "bray", sqrt.dist = TRUE
+  )
+  soil_anova <- as.data.frame(vegan::anova.cca(
+    soil_model, permutations = paired_permutations
+  ))
+  soil_test_list[[marker]] <- data.frame(
+    Marker = marker, N_samples = nrow(marker_rel),
+    N_pairs = nlevels(soil_meta$PairID), N_ASVs = ncol(marker_rel),
+    Pseudo_F = soil_anova$F[1],
+    Partial_R2_after_pair = soil_anova$SumOfSqs[1] /
+      sum(soil_anova$SumOfSqs[1:2]),
+    Raw_p_value = soil_anova$`Pr(>F)`[1],
+    PCoA1_percent = axis_pct[1], PCoA2_percent = axis_pct[2]
+  )
+}
+soil_scores_all <- dplyr::bind_rows(soil_scores_list)
+soil_tests <- dplyr::bind_rows(soil_test_list) %>%
+  mutate(BH_adjusted_p_value = p.adjust(Raw_p_value, method = "BH"),
+         Adjustment_family = "BS vs BR across 16S, ITS, and LSU")
+write.csv(soil_scores_all,
+          file.path(output_dir, "16S_ITS_LSU_paired_soil_PCoA_scores.csv"),
+          row.names = FALSE)
+write.csv(soil_tests,
+          file.path(output_dir, "16S_ITS_LSU_paired_soil_tests.csv"),
+          row.names = FALSE)
+print(soil_tests)
+
+soil_panels <- lapply(names(soil_counts), function(marker) {
+  dat <- soil_scores_list[[marker]]
+  result <- soil_tests[soil_tests$Marker == marker, ]
+  ggplot(dat, aes(PCoA1, PCoA2)) +
+    geom_line(aes(group = PairID, color = Host_species),
+              linewidth = 0.55, alpha = 0.55) +
+    geom_point(aes(color = Host_species, shape = Soil_condition),
+               size = 2.8) +
+    scale_color_manual(values = soil_host_colors) +
+    scale_shape_manual(
+      values = c(BS = 16, BR = 17),
+      labels = c(BS = "Soil without roots (BS)",
+                 BR = "Soil with roots (BR)")
+    ) +
+    labs(
+      title = marker,
+      subtitle = sprintf(
+        "F = %.2f; partial R² = %.3f\nRaw p = %.3f; BH-adjusted p = %.3f",
+        result$Pseudo_F, result$Partial_R2_after_pair,
+        result$Raw_p_value, result$BH_adjusted_p_value
+      ),
+      x = sprintf("PCoA 1 (%.1f%%)", result$PCoA1_percent),
+      y = sprintf("PCoA 2 (%.1f%%)", result$PCoA2_percent),
+      color = "Adjacent host", shape = "Soil type"
+    ) +
+    coord_equal() +
+    theme_minimal(base_size = 11) +
+    theme(plot.subtitle = element_text(size = 9),
+          panel.grid.minor = element_blank())
+})
+p_paired_soil <- patchwork::wrap_plots(soil_panels, nrow = 1,
+                                       guides = "collect") +
+  patchwork::plot_annotation(
+    title = "Paired soil communities across three amplicons",
+    caption = paste(
+      "Each line connects BS and BR from the same host and plant replicate.",
+      "Bray-Curtis distances use within-marker relative reads (square-rooted).",
+      "Pair-conditioned tests enumerate all 4,095 within-pair label swaps;",
+      "BH adjustment covers the three marker tests."
+    )
+  ) &
+  theme(legend.position = "bottom")
+print(p_paired_soil)
+ggsave(file.path(output_dir, "16S_ITS_LSU_paired_soil_PCoA.pdf"),
+       p_paired_soil, width = 17, height = 6)
+relative_rows <- function(x) sweep(x, 1, rowSums(x), "/")
+its_rel <- relative_rows(its_paired)
+lsu_rel <- relative_rows(lsu_fungal_counts)
+its_bray <- vegan::vegdist(its_rel, method = "bray")
+lsu_bray <- vegan::vegdist(lsu_rel, method = "bray")
+
+pcoa_its <- cmdscale(its_bray, k = 2, eig = TRUE, add = TRUE)
+pcoa_lsu <- cmdscale(lsu_bray, k = 2, eig = TRUE, add = TRUE)
+if (ncol(pcoa_its$points) < 2 || ncol(pcoa_lsu$points) < 2) {
+  stop("The paired data do not support a two-axis ordination.")
+}
+pcoa_tbl <- bind_rows(
+  data.frame(Sample_name = paired_names, Marker = "ITS",
+             PCoA1 = pcoa_its$points[, 1], PCoA2 = pcoa_its$points[, 2]),
+  data.frame(Sample_name = paired_names, Marker = "LSU",
+             PCoA1 = pcoa_lsu$points[, 1], PCoA2 = pcoa_lsu$points[, 2])
+) %>% left_join(paired_meta, by = "Sample_name")
+write.csv(pcoa_tbl, file.path(output_dir, "ITS_LSU_Bray_PCoA_scores.csv"),
+          row.names = FALSE)
+
+axis_variance <- data.frame(
+  Marker = c("ITS", "LSU"),
+  Axis1_percent = 100 * c(pcoa_its$eig[1] / sum(pcoa_its$eig[pcoa_its$eig > 0]),
+                          pcoa_lsu$eig[1] / sum(pcoa_lsu$eig[pcoa_lsu$eig > 0])),
+  Axis2_percent = 100 * c(pcoa_its$eig[2] / sum(pcoa_its$eig[pcoa_its$eig > 0]),
+                          pcoa_lsu$eig[2] / sum(pcoa_lsu$eig[pcoa_lsu$eig > 0]))
+)
+print(axis_variance)
+write.csv(axis_variance,
+          file.path(output_dir, "ITS_LSU_Bray_PCoA_axis_variance.csv"),
+          row.names = FALSE)
+set.seed(20260924)
+proc <- vegan::procrustes(pcoa_its$points, pcoa_lsu$points, symmetric = TRUE)
+proc_test <- vegan::protest(pcoa_its$points, pcoa_lsu$points, permutations = 999)
+concordance <- data.frame(Test = "PROTEST on first two PCoA axes",
+  Procrustes_r = unname(proc_test$t0), Procrustes_m2 = proc$ss,
+  Raw_p_value = proc_test$signif, BH_adjusted_p_value = proc_test$signif,
+  Adjustment_family = "Single prespecified cross-marker PROTEST",
+  Matched_specimens = length(paired_names), Permutations = 999)
+write.csv(concordance, file.path(output_dir, "ITS_LSU_Procrustes_statistics.csv"), row.names = FALSE)
+print(concordance)
+proc_tbl <- data.frame(Sample_name = paired_names,
+  ITS1 = proc$X[, 1], ITS2 = proc$X[, 2],
+  LSU1 = proc$Yrot[, 1], LSU2 = proc$Yrot[, 2]) %>% left_join(paired_meta, by = "Sample_name")
+proc_compartment_colors <- c(
+  "Soil" = "gray70",
+  "Endosphere" = "tan2",
+  "Rhizosphere / stolonosphere" = "#009E73",
+  "Aboveground" = "skyblue2"
+)
+proc_compartment <- proc_tbl %>%
+  mutate(
+    Compartment_group = case_when(
+      Compartment %in% c("BS", "BR") ~ "Soil",
+      Compartment %in% c("Rh", "SP") ~ "Rhizosphere / stolonosphere",
+      Compartment %in% c("root", "stolon", "BG") ~ "Endosphere",
+      Compartment %in% c("AG", "leaf") ~ "Aboveground",
+      TRUE ~ NA_character_
+    ),
+    Compartment_group = factor(Compartment_group,
+                               levels = names(proc_compartment_colors))
+  )
+if (anyNA(proc_compartment$Compartment_group)) {
+  stop("An observed Procrustes specimen has no compartment group.")
+}
+proc_points <- bind_rows(
+  proc_compartment %>%
+    transmute(Compartment_group, Marker = "ITS", Axis1 = ITS1, Axis2 = ITS2),
+  proc_compartment %>%
+    transmute(Compartment_group, Marker = "LSU", Axis1 = LSU1, Axis2 = LSU2)
+)
+if (any(table(proc_points$Compartment_group) < 3L)) {
+  stop("An observed-range hull needs at least three points per compartment.")
+}
+proc_hulls <- proc_points %>%
+  group_by(Compartment_group) %>%
+  slice(chull(Axis1, Axis2)) %>%
+  ungroup()
+proc_centroids <- proc_points %>%
+  group_by(Compartment_group) %>%
+  summarise(Axis1 = mean(Axis1), Axis2 = mean(Axis2), .groups = "drop") %>%
+  mutate(Short_label = c("Soil", "Endosphere", "Rh/SP", "Aboveground"))
+p_proc_compartment <- ggplot() +
+  geom_polygon(
+    data = proc_hulls,
+    aes(x = Axis1, y = Axis2, group = Compartment_group,
+        fill = Compartment_group),
+    color = "grey55", linetype = "dotted", linewidth = 0.4, alpha = 0.12
+  ) +
+  geom_segment(data = proc_compartment,
+               aes(x = ITS1, y = ITS2, xend = LSU1, yend = LSU2,
+                   color = Host_species), alpha = 0.5) +
+  geom_point(data = proc_compartment,
+             aes(ITS1, ITS2, color = Host_species), shape = 16, size = 2.1) +
+  geom_point(data = proc_compartment,
+             aes(LSU1, LSU2, color = Host_species), shape = 1, size = 2.1) +
+  geom_label(data = proc_centroids,
+             aes(Axis1, Axis2, label = Short_label),
+             color = "grey20", fill = "white", alpha = 0.75, size = 2.7,
+             linewidth = 0) +
+  scale_color_manual(values = host_pal, name = "Host") +
+  scale_fill_manual(values = proc_compartment_colors, name = "Compartment") +
+  labs(
+    title = "Alignment of paired ITS and LSU ordinations",
+    subtitle = "Host colors and paired points; outlines show observed compartment ranges",
+    x = "Aligned axis 1", y = "Aligned axis 2",
+    caption = paste(
+      "Filled point = ITS; open point = LSU; line = same specimen.\n",
+      "Each hull encloses all plotted ITS and LSU points in that compartment;",
+      "descriptive, not a confidence interval."
+    )
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.caption = element_text(size = 8, hjust = 0))
+print(p_proc_compartment)
+ggsave(file.path(output_dir, "ITS_LSU_Procrustes_host_compartment_observed_ranges.pdf"),
+       p_proc_compartment, width = 10, height = 7,
+       device = grDevices::pdf, useDingbats = FALSE)
+})
+```
+
+# Genus contrasts along the soil plant gradient
+
+The three contrasts are rhizosphere versus soil, endosphere versus soil, and endosphere versus rhizosphere. Each tests the top 150 genera after the original prevalence and count screen, adjusts for host, and uses BH adjustment within marker and contrast. Repeated tissues are retained as in the original fit. 
+
+```{r gradient-ancombc2}
+local({
+output_dir <- section_out("ANCOMBC2")
+contrast_def <- data.frame(
+  Contrast = c("Rhizosphere vs soil", "Endosphere vs soil", "Endosphere vs rhizosphere"),
+  Source = c("Soil", "Soil", "Rhizosphere"),
+  Target = c("Rhizosphere", "Endosphere", "Endosphere"))
+stage_from_part <- function(x) {
+  ifelse(x %in% c("BS", "BR"), "Soil",
+    ifelse(x %in% c("Rh", "SP"), "Rhizosphere",
+      ifelse(x %in% c("root", "stolon", "BG"), "Endosphere", NA_character_)))
+}
+stop_if_bad <- function(test, message) if (isTRUE(test)) stop(message, call. = FALSE)
+read_marker <- function(marker) {
+  if (marker %in% c("16S", "ITS")) {
+    prefix <- if (marker == "16S") "s16" else "its"
+    count_file <- paper_input(paste0(prefix, "_counts"))
+    tax_file <- paper_input(paste0(prefix, "_tax_csv"))
+    meta_file <- paper_input(if (marker == "16S") "s16_meta_all" else "its_meta")
+    stop_if_bad(!all(file.exists(c(count_file, tax_file, meta_file))),
+      paste(marker, "saved count, taxonomy, or metadata file is missing"))
+    counts <- as.matrix(read.csv(count_file, row.names = 1, check.names = FALSE))
+    storage.mode(counts) <- "numeric"
+    tax <- read.csv(tax_file, row.names = 1, check.names = FALSE)
+    meta <- read.delim(meta_file, check.names = FALSE)
+    stop_if_bad(!all(rownames(counts) %in% rownames(tax)) ||
+      !all(colnames(counts) %in% meta$sample.id) ||
+      anyDuplicated(meta$sample.id), paste(marker, "ASV/metadata mismatch"))
+    tax <- tax[rownames(counts), , drop = FALSE]
+    meta <- meta[match(colnames(counts), meta$sample.id), , drop = FALSE]
+    if (marker == "16S") {
+      prokaryotic <- tax$Kingdom %in% c("d__Bacteria", "d__Archaea")
+      stop_if_bad(!any(prokaryotic), "No bacterial/archaeal 16S ASVs found")
+      cat("16S excluded eukaryotic/unresolved ASVs:", sum(!prokaryotic), "\n")
+      counts <- counts[prokaryotic, , drop = FALSE]
+      tax <- tax[prokaryotic, , drop = FALSE]
+    }
+    if (marker == "ITS") stop_if_bad(any(tax$Kingdom != "Fungi"),
+      "ITS saved ASV table includes nonfungal taxa")
+  } else {
+    count_file <- paper_input("lsu_counts")
+    meta_file <- paper_input("lsu_meta")
+    tax_file <- paper_input("lsu_euk")
+    counts <- t(readRDS(count_file)) # ASVs x samples
+    meta <- read.csv(meta_file, check.names = FALSE, fileEncoding = "UTF-8-BOM")
+    tax <- read.delim(tax_file, check.names = FALSE)
+    key_col <- if ("Sequence" %in% names(tax)) "Sequence" else "ASV_ID"
+    keys <- toupper(as.character(tax[[key_col]]))
+    stop_if_bad(anyDuplicated(keys) || anyDuplicated(meta$SampleID) ||
+      !all(colnames(counts) %in% meta$SampleID),
+      "LSU sequences or sample metadata are not unique and matched")
+    hit <- match(toupper(rownames(counts)), keys)
+    fungal <- !is.na(hit) & tax$Kingdom[hit] == "Fungi"
+    fungal[is.na(fungal)] <- FALSE
+    cat("LSU EUKARYOME fungal ASVs:", sum(fungal), "of", nrow(counts), "\n")
+    counts <- counts[fungal, , drop = FALSE]
+    tax <- tax[hit[fungal], , drop = FALSE]
+    rownames(tax) <- rownames(counts)
+    meta <- meta[match(colnames(counts), meta$SampleID), , drop = FALSE]
+    meta$sample.id <- meta$SampleID
+  }
+  stop_if_bad(anyNA(counts) || any(counts < 0) ||
+    any(counts != floor(counts)) || anyDuplicated(rownames(counts)) ||
+    anyDuplicated(colnames(counts)), paste(marker, "count table is invalid"))
+  meta$Stage <- stage_from_part(meta$Shortened_description)
+  meta$Host_species <- trimws(as.character(meta$Host_species))
+  meta$Plant_ID <- paste(meta$Host_species, meta$Plant_replicate, sep = "_")
+  keep <- !is.na(meta$Stage) & colSums(counts) > 0
+  counts <- counts[, keep, drop = FALSE]
+  meta <- meta[keep, , drop = FALSE]
+  rownames(meta) <- colnames(counts)
+  list(counts = counts, tax = tax, meta = meta)
+}
+markers <- lapply(c("16S", "ITS", "LSU"), read_marker)
+names(markers) <- c("16S", "ITS", "LSU")
+aggregate_genus <- function(obj, marker) {
+  ranks <- c("Phylum", "Class", "Order", "Family", "Genus")
+  tax <- obj$tax
+  for (rank in ranks) {
+    if (!rank %in% names(tax)) tax[[rank]] <- NA_character_
+    tax[[rank]] <- trimws(as.character(tax[[rank]]))
+    tax[[rank]][is.na(tax[[rank]]) | tax[[rank]] == ""] <- "Unresolved"
+  }
+  genus_known <- tax$Genus != "Unresolved" &
+    !grepl("^(unc\\.|unclassified|incertae|unknown)", tax$Genus,
+      ignore.case = TRUE)
+  last_known <- ifelse(tax$Family != "Unresolved", tax$Family,
+    ifelse(tax$Order != "Unresolved", tax$Order,
+      ifelse(tax$Class != "Unresolved", tax$Class, tax$Phylum)))
+  labels <- ifelse(genus_known, tax$Genus,
+    paste0("Unresolved genus (", last_known, ")"))
+  keys <- paste(marker, tax$Phylum, tax$Class, tax$Order, tax$Family,
+    ifelse(genus_known, tax$Genus, "Unresolved genus"), sep = "|")
+  tab <- rowsum(obj$counts, group = keys, reorder = FALSE)
+  label_lookup <- data.frame(Taxon_key = keys, Label = labels)
+  label_lookup <- label_lookup[!duplicated(label_lookup$Taxon_key), ]
+  stop_if_bad(!identical(colSums(tab), colSums(obj$counts)),
+    paste(marker, "genus aggregation did not preserve all reads"))
+  list(counts = tab, labels = label_lookup, meta = obj$meta)
+}
+genus <- Map(aggregate_genus, markers, names(markers))
+fit_contrast <- function(marker, definition) {
+  obj <- genus[[marker]]
+  source <- definition$Source
+  target <- definition$Target
+  md <- obj$meta[obj$meta$Stage %in% c(source, target), , drop = FALSE]
+  coverage <- table(md$Host_species, factor(md$Stage, levels = c(source, target)))
+  hosts <- rownames(coverage)[rowSums(coverage > 0) == 2L]
+  md <- md[md$Host_species %in% hosts, , drop = FALSE]
+  md$Contrast_group <- factor(md$Stage, levels = c(source, target),
+    labels = c("Source", "Target"))
+  md$Host_species <- droplevels(factor(md$Host_species))
+  md$Plant_ID <- factor(md$Plant_ID)
+  sample_count <- as.data.frame(table(Host = md$Host_species,
+    Stage = md$Stage), stringsAsFactors = FALSE)
+  sample_count <- sample_count[sample_count$Freq > 0, , drop = FALSE]
+  sample_count$Marker <- marker
+  sample_count$Contrast <- definition$Contrast
+  if (nrow(md) < 6 || length(hosts) < 1L) stop(marker, ": too few paired-stage samples")
+  tab <- obj$counts[, rownames(md), drop = FALSE]
+  tab <- tab[rowSums(tab > 0) >= 2L & rowSums(tab) >= 10L, , drop = FALSE]
+  tab <- tab[head(order(rowSums(tab), decreasing = TRUE), 150L), , drop = FALSE]
+  stop_if_bad(nrow(tab) < 2L, paste(marker, "has fewer than 2 tested genera"))
+  ps <- phyloseq::phyloseq(
+    phyloseq::otu_table(tab, taxa_are_rows = TRUE),
+    phyloseq::sample_data(md[, c("Host_species", "Plant_ID", "Contrast_group"),
+      drop = FALSE]))
+  cat(marker, definition$Contrast, ":", ncol(tab), "samples,", nrow(tab),
+    "genera; hosts:", paste(hosts, collapse = ", "), "\n")
+  fit <- tryCatch(ANCOMBC::ancombc2(data = ps,
+    fix_formula = "Host_species + Contrast_group",
+    p_adj_method = "BH", alpha = 0.05, pseudo_sens = TRUE,
+    prv_cut = 0.10, lib_cut = 0, n_cl = 1, verbose = FALSE),
+    error = function(e) e)
+  if (inherits(fit, "error")) stop(marker, " ", definition$Contrast,
+    " ANCOM-BC2 failed: ", conditionMessage(fit))
+  res <- fit$res
+  wanted <- paste0(c("lfc_", "q_", "diff_robust_"), "Contrast_groupTarget")
+  stop_if_bad(!all(c("taxon", wanted) %in% names(res)),
+    paste(marker, "ANCOM-BC2 output columns changed"))
+  idx <- match(res$taxon, obj$labels$Taxon_key)
+  stop_if_bad(anyNA(idx), paste(marker, "lost genus labels"))
+  out <- data.frame(Marker = marker, Contrast = definition$Contrast,
+    Source = source, Target = target, Taxon_key = res$taxon,
+    Label = obj$labels$Label[idx], LFC = res[[wanted[1]]],
+    Raw_p_value = res[["p_Contrast_groupTarget"]],
+    SE = res[["se_Contrast_groupTarget"]],
+    CI95_lower = res[[wanted[1]]] - 1.96 * res[["se_Contrast_groupTarget"]],
+    CI95_upper = res[[wanted[1]]] + 1.96 * res[["se_Contrast_groupTarget"]],
+    BH_adjusted_p_value = res[[wanted[2]]],
+    Adjustment_family = paste(marker, definition$Contrast, "tested genera after ANCOM filtering"),
+    Q = res[[wanted[2]]], Robust = res[[wanted[3]]],
+    N_source = sum(md$Stage == source), N_target = sum(md$Stage == target),
+    N_hosts = length(hosts), stringsAsFactors = FALSE)
+  out$Significant <- !is.na(out$Robust) & out$Robust &
+    !is.na(out$Q) & out$Q < 0.05
+  list(results = out, samples = sample_count)
+}
+
+if (isTRUE(params$refit_ancom)) {
+  fits <- list()
+  for (marker in names(genus)) for (i in seq_len(nrow(contrast_def))) {
+    fits[[paste(marker, i)]] <- fit_contrast(marker, contrast_def[i, ])
+  }
+  all_results <- do.call(rbind, lapply(fits, `[[`, "results"))
+  all_samples <- do.call(rbind, lapply(fits, `[[`, "samples"))
+} else {
+  all_results <- read.csv(paper_input("ancom_results"), check.names = FALSE)
+  all_samples <- read.csv(paper_input("ancom_samples"), check.names = FALSE)
+  if (!"Raw_p_value" %in% names(all_results)) {
+    all_results$Raw_p_value <- NA_real_
+    all_results$SE <- all_results$CI95_lower <- all_results$CI95_upper <- NA_real_
+    cat("The archived ANCOM export lacks raw p-values and SEs. Set refit_ancom=true to obtain them.\n")
+  }
+  all_results$BH_adjusted_p_value <- all_results$Q
+  all_results$Adjustment_family <- paste(all_results$Marker, all_results$Contrast,
+    "tested genera after ANCOM filtering")
+}
+write.csv(all_results, file.path(output_dir, "ANCOMBC2_all_taxa.csv"), row.names = FALSE)
+write.csv(all_samples, file.path(output_dir, "ANCOMBC2_sample_counts.csv"), row.names = FALSE)
+write.csv(aggregate(Significant ~ Marker + Contrast, all_results, sum),
+  file.path(output_dir, "ANCOMBC2_significance_summary.csv"), row.names = FALSE)
+make_heatmap <- function(marker) {
+  initial_device <- grDevices::dev.cur()
+  on.exit({while (grDevices::dev.cur() > initial_device) grDevices::dev.off()}, add = TRUE)
+  d <- all_results[all_results$Marker == marker, , drop = FALSE]
+  sig <- unique(d$Taxon_key[d$Significant])
+  if (length(sig)) {
+    candidate <- d[d$Taxon_key %in% sig, , drop = FALSE]
+    magnitude <- aggregate(abs(candidate$LFC),
+      by = list(Taxon_key = candidate$Taxon_key), FUN = mean, na.rm = TRUE)
+    selected <- head(magnitude$Taxon_key[order(magnitude$x, decreasing = TRUE)], 30)
+    note <- paste(length(sig), "genera significant in ≥1 contrast (robust BH q < 0.05)")
+  } else {
+    candidate <- d[!is.na(d$Q), , drop = FALSE]
+    q_min <- aggregate(Q ~ Taxon_key, candidate, min)
+    selected <- head(q_min$Taxon_key[order(q_min$Q)], 30)
+    note <- "No robust BH q < 0.05 genera; smallest q-values shown for context"
+  }
+  if (!length(selected)) stop(marker, ": no estimated genera for heatmap")
+  selected_data <- d[d$Taxon_key %in% selected, , drop = FALSE]
+  lookup <- selected_data[!duplicated(selected_data$Taxon_key), c("Taxon_key", "Label")]
+  labels <- lookup$Label[match(selected, lookup$Taxon_key)]
+  duplicated_labels <- duplicated(labels) | duplicated(labels, fromLast = TRUE)
+  labels[duplicated_labels] <- paste0(labels[duplicated_labels], " [",
+    seq_along(labels)[duplicated_labels], "]")
+  mat <- matrix(NA_real_, nrow = length(selected), ncol = nrow(contrast_def),
+    dimnames = list(labels, contrast_def$Contrast))
+  nums <- matrix("", nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  for (j in seq_len(nrow(contrast_def))) {
+    one <- selected_data[selected_data$Contrast == contrast_def$Contrast[j], ]
+    index <- match(selected, one$Taxon_key)
+    mat[, j] <- one$LFC[index]
+    val <- one$LFC[index]
+    star <- !is.na(index) & one$Significant[index]
+    nums[, j] <- ifelse(is.na(val), "", sprintf("%.1f%s", val,
+      ifelse(star, "*", "")))
+  }
+  finite <- mat[is.finite(mat)]
+  stop_if_bad(!length(finite), paste(marker, "has no finite heatmap effects"))
+  # Cluster taxa by their estimated response profiles, not by taxonomy.
+  # stats::dist compares only shared nonmissing contrasts and rescales for
+  # the number available. Pairs with no shared contrast have no estimable
+  # distance; place them beyond the largest observed distance for display.
+  row_tree <- FALSE
+  if (nrow(mat) >= 2L) {
+    distances <- as.matrix(stats::dist(mat, method = "euclidean"))
+    off_diagonal <- row(distances) != col(distances)
+    no_overlap <- off_diagonal & !is.finite(distances)
+    if (any(no_overlap)) {
+      observed <- distances[off_diagonal & is.finite(distances)]
+      stop_if_bad(!length(observed),
+        paste(marker, "taxa have no comparable log-fold-change estimates"))
+      distances[no_overlap] <- max(observed) + 1
+    }
+    diag(distances) <- 0
+    row_tree <- stats::hclust(stats::as.dist(distances), method = "complete")
+    cat(marker, "dendrogram pairs without shared estimates:",
+      sum(no_overlap) / 2, "\n")
+  }
+  max_abs <- max(1, ceiling(max(abs(finite))))
+  colors <- colorRampPalette(c("steelblue", "white", "firebrick"))(100)
+  pdf_file <- file.path(output_dir, paste0(marker,
+    "_heatmap_ANCOM_soil_rhizosphere_endosphere.pdf"))
+  png_file <- sub("\\.pdf$", ".png", pdf_file)
+  for (plot_file in c(pdf_file, png_file)) {
+    pheatmap::pheatmap(mat, cluster_cols = FALSE,
+      cluster_rows = row_tree,
+      main = paste0(marker, " ANCOM-BC2: pooled soil–plant gradient\n", note),
+      color = colors, breaks = seq(-max_abs, max_abs, length.out = 101),
+      border_color = NA, display_numbers = nums, fontsize_number = 7,
+      fontsize_row = 8, fontsize_col = 9, na_col = "grey90",
+      filename = plot_file, width = 11,
+      height = max(7, 2.8 + 0.27 * nrow(mat)), silent = TRUE)
+  }
+  cat("Saved", pdf_file, "and", png_file, "\n")
+}
+invisible(lapply(names(genus), make_heatmap))
+})
+```
+
+```{r display-heatmap-16s, echo=FALSE, out.width='85%'}
+knitr::include_graphics(file.path(paper_out, "ANCOMBC2", "16S_heatmap_ANCOM_soil_rhizosphere_endosphere.png"), rel_path = FALSE)
+```
+
+```{r display-heatmap-its, echo=FALSE, out.width='85%'}
+knitr::include_graphics(file.path(paper_out, "ANCOMBC2", "ITS_heatmap_ANCOM_soil_rhizosphere_endosphere.png"), rel_path = FALSE)
+```
+
+```{r display-heatmap-lsu, echo=FALSE, out.width='85%'}
+knitr::include_graphics(file.path(paper_out, "ANCOMBC2", "LSU_heatmap_ANCOM_soil_rhizosphere_endosphere.png"), rel_path = FALSE)
+```
+
+# Sample design
+
+```{r sampling-design}
+local({
+  meta <- read.csv(paper_input("lsu_meta"), fileEncoding = "UTF-8-BOM")
+  design <- distinct(meta, Host_species, Shortened_description, Plant_replicate) %>%
+    count(Host_species, Shortened_description, name = "n")
+  p <- ggplot(design, aes(Shortened_description, Host_species, color = Host_species)) +
+    geom_point(size = 4) + geom_text(aes(label = n), color = "white", size = 2.5) +
+    scale_color_manual(values = c(Calamagrostis = "#FF7F00", Chusquea = "#4DAF4A",
+      Espeletia = "#E41A1C", Oreobolus = "#A65628", Oritrophium = "#377EB8", Racomitrium = "#984EA3")) +
+    labs(x = "Sampled compartment", y = NULL) + theme_minimal() + theme(legend.position = "none")
+  print(p)
+  ggsave(file.path(paper_out, "sampling_design.pdf"), p, width = 10, height = 4)
+  write.csv(design, file.path(paper_out, "sampling_design_counts.csv"), row.names = FALSE)
+})
+```
+
+# Anatomy and microscopy figure assemblies
+
+The images below preserve the final manual layouts embedded in the manuscript. The abundance panels are regenerated above.
+
+```{r assembled-anatomy-Espeletia, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Espeletia"), rel_path = FALSE)
+```
+
+```{r assembled-anatomy-Oritrophium, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Oritrophium"), rel_path = FALSE)
+```
+
+```{r assembled-anatomy-Calamagrostis, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Calamagrostis"), rel_path = FALSE)
+```
+
+```{r assembled-anatomy-Chusquea, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Chusquea"), rel_path = FALSE)
+```
+
+```{r assembled-anatomy-Oreobolus, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Oreobolus"), rel_path = FALSE)
+```
+
+```{r assembled-anatomy-Racomitrium, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("anatomy_Racomitrium"), rel_path = FALSE)
+```
+
+```{r assembled-amf-image, echo=FALSE, out.width='95%'}
+knitr::include_graphics(paper_input("amf_image"), rel_path = FALSE)
+```
+
+# Archived sequence processing
+
+These upstream chunks are retained for provenance and manual use. All use `eval=FALSE`.
+
+## 16S QIIME 2
+
+QIIME 2 2024.10.1 was used for denoising. 
+
+
+```{bash archive-16s-1, eval=FALSE}
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path 16S/metadata.tsv \
+  --output-path 16S/qiime2output/paired-end-demux.qza \
+  --input-format PairedEndFastqManifestPhred33V2
+```
+
+
+```{bash archive-16s-2, eval=FALSE}
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs 16S/qiime2output/paired-end-demux.qza \
+  --p-trunc-len-f 280 \
+  --p-trunc-len-r 260 \
+  --p-trim-left-f 20 \
+  --p-trim-left-r 20 \
+  --p-pooling-method independent \
+  --p-max-ee-f 2 \
+  --p-max-ee-r 2 \
+  --p-n-threads 0 \
+  --p-min-fold-parent-over-abundance 2 \
+  --p-chimera-method pooled \
+  --o-table 16S/qiime2output/table.qza \
+  --o-representative-sequences 16S/qiime2output/rep-seqs.qza \
+  --o-denoising-stats 16S/qiime2output/denoising-stats.qza
+```
+
+
+```{bash archive-16s-taxonomy, eval=FALSE}
+# QIIME 2 2025.10.1; SILVA 138.2 SSURef NR99 classifier.
+# Classifier UUID ee876dd6-edfa-4c81-b0a4-a885b9b4acd1 in taxonomy.qza provenance.
+: "${SILVA_CLASSIFIER:?Set the path to the archived SILVA classifier}"
+qiime feature-classifier classify-sklearn \
+  --i-classifier "$SILVA_CLASSIFIER" \
+  --i-reads 16S/qiime2output/rep-seqs.qza \
+  --p-confidence 0.7 \
+  --p-n-jobs 8 \
+  --o-classification 16S/qiime2output/taxonomy.qza
+```
+
+## ITS QIIME 2
+
+QIIME 2 2024.10.1 was used for denoising. The classifier was trained from UNITE 10 99% developer references dated 19 February 2025.
+
+
+```{bash archive-its-1, eval=FALSE}
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path ITS/metadata.csv \
+  --output-path ITS/qiime2output/paired-end-demux.qza \
+  --input-format PairedEndFastqManifestPhred33V2
+```
+
+
+```{bash archive-its-2, eval=FALSE}
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs ITS/qiime2output/paired-end-demux.qza \
+  --p-trunc-len-f 208 \
+  --p-trunc-len-r 209 \
+  --p-trim-left-f 36 \
+  --p-trim-left-r 36 \
+  --p-pooling-method independent \
+  --p-max-ee-f 2 \
+  --p-max-ee-r 2 \
+  --p-n-threads 0 \
+  --p-chimera-method pooled \
+  --o-table ITS/qiime2output/table.qza \
+  --o-representative-sequences ITS/qiime2output/rep-seqs.qza \
+  --o-denoising-stats ITS/qiime2output/denoising-stats.qza
+```
+
+
+```{bash archive-its-taxonomy, eval=FALSE}
+# QIIME 2 2024.10.1; UNITE 10 99%, 19 February 2025 developer release.
+# Classifier UUID b4188739-0eb9-49f6-a6d2-d79e13346e83 in taxonomy.qza provenance.
+: "${UNITE_CLASSIFIER:?Set the path to the archived UNITE classifier}"
+qiime feature-classifier classify-sklearn \
+  --i-classifier "$UNITE_CLASSIFIER" \
+  --i-reads ITS/qiime2output/rep-seqs.qza \
+  --p-confidence 0.7 \
+  --p-n-jobs 1 \
+  --o-classification ITS/qiime2output/taxonomy.qza
+```
+
+## PacBio LSU denoising and V18 placement
+
+Requires DADA2, Biostrings, ShortRead, tidyverse packages, phyloseq, ape and phangorn in R. The `amf_v18_local` conda environment must provide BLAST+, MAFFT and classic RAxML. V18 reference assets and clade-extraction scripts must be present at `pipeline_path`. Run the disabled chunks in order when rebuilding upstream outputs.
+
+
+```{r archive-lsu-paths, eval=FALSE}
+library(dada2)
+library(Biostrings)
+library(ShortRead)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(phyloseq)
+library(ape)
+library(phangorn)
+project_path <- path.expand("~/Documents/CouradeauLab/paramos/Rhizosphere/Amplicons/Rhizosphere_Amplicon_Data_Analysis")
+base_path <- path.expand("~/Documents/CouradeauLab/paramos/Rhizosphere/Amplicons/LSU/data/r64404e_20250325_141946/1_C03")
+out_path <- file.path(base_path, "analysis_output_corrected")
+fastq_path <- file.path(base_path, "fastq_output")
+table_dir <- file.path(out_path, "tables")
+phylo_dir <- file.path(out_path, "V18_phylogenetic_placement")
+pipeline_path <- path.expand("~/Documents/CouradeauLab/paramos/Rhizosphere/Amplicons/LSU/AMF-LSU-Database-and-Pipeline2/2024_AMFPipeline/2024_AMFPipeline_ASV")
+dir.create(table_dir, recursive=TRUE, showWarnings=FALSE)
+FWD <- "ACCCGCTGAACTTAAGC"
+REV <- "TCCTGAGGGAAACTTCG"
+MIN_LEN <- 850L
+MAX_LEN <- 1100L
+MAX_EE <- 2
+meta <- read.csv(file.path(project_path, "LSU_metadata_updated.csv"), check.names=FALSE)
+fastq_files <- sort(list.files(fastq_path, pattern="\\.fastq(?:\\.gz)?$", full.names=TRUE))
+sample_names <- sub("\\.fastq(?:\\.gz)?$", "", basename(fastq_files))
+stopifnot(setequal(sample_names, meta$SampleID))
+Sys.setenv(AMF_CONDA_EXE=Sys.which("conda"), AMF_CONDA_ENV="amf_v18_local", LSU_PHYLO_DIR=phylo_dir, LSU_OUT_DIR=out_path)
+```
+
+
+```{r archive-remove-primers, eval=FALSE}
+noprimer_dir <- file.path(out_path, "fastq_noprimers")
+filtered_dir <- file.path(out_path, "fastq_filtered")
+dir.create(noprimer_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(filtered_dir, recursive = TRUE, showWarnings = FALSE)
+
+noprimer_files <- file.path(
+  noprimer_dir, paste0(sample_names, "_noprimer.fastq.gz")
+)
+names(fastq_files) <- names(noprimer_files) <- sample_names
+
+primer_summary <- removePrimers(
+  fn = fastq_files,
+  fout = noprimer_files,
+  primer.fwd = FWD,
+  primer.rev = rc(REV),
+  orient = TRUE,
+  max.mismatch = 2,
+  allow.indels = TRUE,
+  verbose = TRUE
+)
+
+write.csv(primer_summary, file.path(table_dir, "primer_removal_tracking.csv"))
+primer_summary
+```
+
+
+```{r archive-filter-denoise, eval=FALSE}
+filtered_files <- file.path(
+  filtered_dir, paste0(sample_names, "_filtered.fastq.gz")
+)
+names(filtered_files) <- sample_names
+
+filter_summary <- filterAndTrim(
+  fwd = noprimer_files,
+  filt = filtered_files,
+  minLen = MIN_LEN,
+  maxLen = MAX_LEN,
+  maxN = 0,
+  maxEE = MAX_EE,
+  minQ = 3,
+  rm.phix = FALSE,
+  compress = TRUE,
+  multithread = TRUE,
+  verbose = TRUE
+)
+
+if (any(filter_summary[, "reads.out"] == 0)) {
+  stop("At least one sample has zero reads after filtering; inspect filter_summary.")
+}
+
+err <- learnErrors(
+  filtered_files,
+  errorEstimationFunction = PacBioErrfun,
+  BAND_SIZE = 32,
+  multithread = TRUE,
+  randomize = TRUE,
+  verbose = TRUE
+)
+saveRDS(err, file.path(out_path, "PacBio_error_model.rds"))
+plotErrors(err, nominalQ = TRUE)
+
+derep <- derepFastq(filtered_files, verbose = TRUE)
+names(derep) <- sample_names
+
+dada_out <- dada(
+  derep,
+  err = err,
+  BAND_SIZE = 32,
+  pool = "pseudo",
+  multithread = TRUE
+)
+
+seqtab_sequence_names <- makeSequenceTable(dada_out)
+seqtab_sequence_names <- removeBimeraDenovo(
+  seqtab_sequence_names,
+  method = "consensus",
+  multithread = TRUE,
+  verbose = TRUE
+)
+
+getN <- function(x) sum(getUniques(x))
+tracking <- tibble(
+  SampleID = sample_names,
+  input = primer_summary[, 1],
+  primer_oriented = primer_summary[, 2],
+  filtered = filter_summary[, "reads.out"],
+  denoised = vapply(dada_out, getN, numeric(1)),
+  nonchim = rowSums(seqtab_sequence_names)
+)
+
+write.csv(tracking, file.path(table_dir, "DADA2_read_tracking.csv"), row.names = FALSE)
+saveRDS(seqtab_sequence_names, file.path(out_path, "seqtab_nochim_sequences.rds"))
+```
+
+
+```{r archive-load-seqtab, eval=FALSE}
+seqtab_sequence_names <- readRDS(file.path(out_path, "seqtab_nochim_sequences.rds"))
+if (!is.matrix(seqtab_sequence_names)) {
+  seqtab_sequence_names <- as.matrix(seqtab_sequence_names)
+}
+if (!setequal(rownames(seqtab_sequence_names), as.character(meta$SampleID))) {
+  stop("DADA2 table sample names do not match LSU metadata.")
+}
+
+seqtab_sequence_names <- seqtab_sequence_names[as.character(meta$SampleID), , drop = FALSE]
+asv_sequences <- colnames(seqtab_sequence_names)
+
+if (!all(grepl("^[ACGTN]+$", asv_sequences))) {
+  stop("Expected DNA sequences as columns of seqtab_nochim.rds.")
+}
+
+asv_ids <- paste0("ASV", seq_along(asv_sequences))
+seqtab_ids <- seqtab_sequence_names
+colnames(seqtab_ids) <- asv_ids
+
+asv_map <- tibble(
+  ASV_ID = asv_ids,
+  Sequence = asv_sequences,
+  Length = nchar(asv_sequences),
+  Total_reads = colSums(seqtab_ids),
+  Prevalence = colSums(seqtab_ids > 0)
+)
+
+write.csv(asv_map, file.path(table_dir, "LSU_ASV_ID_mapping.csv"), row.names = FALSE)
+saveRDS(seqtab_ids, file.path(out_path, "seqtab_nochim_ASV_IDs.rds"))
+
+cat(nrow(seqtab_ids), "samples;", ncol(seqtab_ids), "non-chimeric ASVs\n")
+summary(asv_map$Length)
+```
+
+
+```{r archive-export-asvs, eval=FALSE}
+asv_set <- DNAStringSet(asv_map$Sequence)
+names(asv_set) <- asv_map$ASV_ID
+writeXStringSet(asv_set, file.path(out_path, "LSU_ASVs.fasta"), width = 10000)
+
+count_export <- as.data.frame(t(seqtab_ids), check.names = FALSE) %>%
+  rownames_to_column("X.ASV.ID")
+readr::write_tsv(count_export, file.path(out_path, "LSU_ASV_counts.tsv"))
+```
+
+
+```{r archive-prepare-v18, eval=FALSE}
+needed_v18_files <- c(
+  "V18_LSUDB_052025.fasta",
+  "V18_LSUDB_052025_AMFONLY.fasta",
+  "Root_V18_LSUDB_052025.newick",
+  "AMFcladesExtract.R",
+  "AMFcladeTaxonomy.R"
+)
+
+missing_v18 <- needed_v18_files[
+  !file.exists(file.path(pipeline_path, needed_v18_files))
+]
+if (length(missing_v18) > 0) {
+  stop("Missing V18 pipeline assets: ", paste(missing_v18, collapse = ", "))
+}
+
+dir.create(phylo_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(phylo_dir, "RAxMLfiles"), showWarnings = FALSE)
+dir.create(file.path(phylo_dir, "cladeOutputs"), showWarnings = FALSE)
+dir.create(file.path(phylo_dir, "batches"), showWarnings = FALSE)
+
+file.copy(
+  file.path(pipeline_path, needed_v18_files),
+  file.path(phylo_dir, needed_v18_files),
+  overwrite = TRUE
+)
+file.copy(
+  file.path(out_path, "LSU_ASVs.fasta"),
+  file.path(phylo_dir, "ASVrepseqs_clean.fasta"),
+  overwrite = TRUE
+)
+file.copy(
+  file.path(out_path, "LSU_ASV_counts.tsv"),
+  file.path(phylo_dir, "ASVtable_clean.tsv"),
+  overwrite = TRUE
+)
+
+cat("V18 placement workspace prepared at:\n", phylo_dir, "\n")
+```
+
+
+```{bash archive-v18-prescreen, eval=FALSE}
+set -euo pipefail
+
+: "${AMF_CONDA_EXE:?Run the R paths chunk first}"
+: "${AMF_CONDA_ENV:?Run the R paths chunk first}"
+: "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
+cd "${LSU_PHYLO_DIR}"
+
+"${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" makeblastdb \
+  -in V18_LSUDB_052025.fasta \
+  -dbtype nucl \
+  -out V18_LSUDB_052025_full
+
+"${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" blastn \
+  -query ASVrepseqs_clean.fasta \
+  -db V18_LSUDB_052025_full \
+  -evalue 1e-3 \
+  -max_target_seqs 5 \
+  -num_threads 10 \
+  -outfmt '6 qseqid sseqid pident length qlen evalue bitscore' \
+  -out V18_competitive_blast.tsv
+
+test -s V18_competitive_blast.tsv || {
+  echo "ERROR: competitive V18 BLAST produced no hits." >&2
+  exit 1
+}
+wc -l V18_competitive_blast.tsv
+```
+
+
+```{r archive-subset-v18-candidates, eval=FALSE}
+blast_file <- file.path(phylo_dir, "V18_competitive_blast.tsv")
+candidate_file <- file.path(phylo_dir, "candidate_ASV_ids.txt")
+
+if (file.exists(blast_file)) {
+  blast_hits <- readr::read_tsv(
+    blast_file,
+    col_names = c(
+      "ASV_ID", "Reference_ID", "Percent_identity", "Alignment_length",
+      "Query_length", "Evalue", "Bitscore"
+    ),
+    show_col_types = FALSE
+  )
+
+  amf_reference_ids <- names(readDNAStringSet(
+    file.path(phylo_dir, "V18_LSUDB_052025_AMFONLY.fasta")
+  ))
+
+  blast_hits <- blast_hits %>%
+    mutate(
+      Query_coverage = Alignment_length / Query_length,
+      AMF_reference = Reference_ID %in% amf_reference_ids
+    )
+
+  best_amf <- blast_hits %>%
+    filter(AMF_reference) %>%
+    arrange(ASV_ID, desc(Bitscore), Evalue, desc(Query_coverage)) %>%
+    distinct(ASV_ID, .keep_all = TRUE) %>%
+    transmute(
+      ASV_ID,
+      AMF_reference_ID = Reference_ID,
+      AMF_percent_identity = Percent_identity,
+      AMF_alignment_length = Alignment_length,
+      Query_length,
+      AMF_query_coverage = Query_coverage,
+      AMF_evalue = Evalue,
+      AMF_bitscore = Bitscore
+    )
+
+  best_outgroup <- blast_hits %>%
+    filter(!AMF_reference) %>%
+    arrange(ASV_ID, desc(Bitscore), Evalue, desc(Query_coverage)) %>%
+    distinct(ASV_ID, .keep_all = TRUE) %>%
+    transmute(
+      ASV_ID,
+      Outgroup_reference_ID = Reference_ID,
+      Outgroup_bitscore = Bitscore
+    )
+
+  blast_audit <- full_join(best_amf, best_outgroup, by = "ASV_ID") %>%
+    mutate(
+      Candidate_for_placement =
+        !is.na(AMF_bitscore) &
+        AMF_query_coverage >= 0.50 &
+        (is.na(Outgroup_bitscore) | AMF_bitscore >= Outgroup_bitscore)
+    ) %>%
+    arrange(desc(Candidate_for_placement), ASV_ID)
+
+  readr::write_tsv(
+    blast_audit,
+    file.path(phylo_dir, "V18_competitive_blast_audit.tsv")
+  )
+
+  candidate_ids <- blast_audit %>%
+    filter(Candidate_for_placement) %>%
+    pull(ASV_ID) %>%
+    intersect(asv_ids)
+
+  if (length(candidate_ids) == 0) {
+    stop("Competitive V18 BLAST pre-screen returned no candidate ASVs.")
+  }
+  writeLines(candidate_ids, candidate_file)
+
+  candidate_set <- asv_set[candidate_ids]
+  writeXStringSet(
+    candidate_set,
+    file.path(phylo_dir, "ASVrepseqs_clean_BLAST.fasta"),
+    width = 10000
+  )
+
+  candidate_counts <- count_export %>% filter(X.ASV.ID %in% candidate_ids)
+  readr::write_tsv(
+    candidate_counts,
+    file.path(phylo_dir, "ASVtable_clean_BLASTonly.tsv")
+  )
+  cat(length(candidate_ids), "candidate ASVs prepared for placement.\n")
+  print(blast_audit %>% count(Candidate_for_placement))
+} else {
+  cat("V18_competitive_blast.tsv is not present yet; run section 5.2 first.\n")
+}
+```
+
+
+```{bash archive-v18-alignment, eval=FALSE}
+set -euo pipefail
+
+: "${AMF_CONDA_EXE:?Run the R paths chunk first}"
+: "${AMF_CONDA_ENV:?Run the R paths chunk first}"
+: "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
+cd "${LSU_PHYLO_DIR}"
+
+"${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" mafft \
+  --auto --thread -1 \
+  V18_LSUDB_052025.fasta \
+  > V18_LSUDB_052025_aligned.fasta
+
+"${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" mafft \
+  --addfragments ASVrepseqs_clean_BLAST.fasta \
+  --keeplength --thread -1 \
+  V18_LSUDB_052025_aligned.fasta \
+  > V18_plus_candidates_aligned.fasta
+```
+
+
+```{r archive-make-placement-batches, eval=FALSE}
+aligned_file <- file.path(phylo_dir, "V18_plus_candidates_aligned.fasta")
+backbone_file <- file.path(phylo_dir, "Root_V18_LSUDB_052025.newick")
+
+if (file.exists(aligned_file)) {
+  aligned <- readDNAStringSet(aligned_file)
+  names(aligned) <- trimws(names(aligned))
+
+if (anyDuplicated(names(aligned))) {
+  stop("Duplicate sequence identifiers after trimming FASTA headers.")
+}
+  backbone <- read.tree(backbone_file)
+
+  missing_backbone_tips <- setdiff(backbone$tip.label, names(aligned))
+  if (length(missing_backbone_tips) > 0) {
+    stop(
+      "Aligned FASTA is missing backbone tips; first missing tip: ",
+      missing_backbone_tips[[1]]
+    )
+  }
+
+  reference_aligned <- aligned[backbone$tip.label]
+  query_aligned <- aligned[grepl("^ASV[0-9]+$", names(aligned))]
+  if (length(query_aligned) == 0) stop("No aligned ASV sequences found.")
+
+  batch_size <- 15L  # follows the validated V18 pipeline's placement batch size
+  batch_id <- ceiling(seq_along(query_aligned) / batch_size)
+  batch_dir <- file.path(phylo_dir, "batches")
+  old_batches <- list.files(batch_dir, pattern = "^batch_[0-9]+\\.fasta$", full.names = TRUE)
+  if (length(old_batches) > 0) file.remove(old_batches)
+
+  for (i in sort(unique(batch_id))) {
+    batch_queries <- query_aligned[batch_id == i]
+    writeXStringSet(
+      c(reference_aligned, batch_queries),
+      file.path(batch_dir, sprintf("batch_%04d.fasta", i)),
+      width = 10000
+    )
+  }
+
+  cat(length(unique(batch_id)), "tree batches created for", length(query_aligned), "ASVs.\n")
+} else {
+  cat("Aligned candidate file not found; run section 5.4, then rerun this chunk.\n")
+}
+```
+
+
+```{bash archive-v18-constrained-trees, eval=FALSE}
+set -euo pipefail
+
+: "${AMF_CONDA_EXE:?Run the R paths chunk first}"
+: "${AMF_CONDA_ENV:?Run the R paths chunk first}"
+: "${LSU_PHYLO_DIR:?Run the R paths chunk first}"
+cd "${LSU_PHYLO_DIR}"
+
+mkdir -p RAxMLfiles cladeOutputs
+
+RAXML_BIN=$("${AMF_CONDA_EXE}" run -n "${AMF_CONDA_ENV}" sh -c \
+  'command -v raxmlHPC-PTHREADS || command -v raxmlHPC-PTHREADS-SSE3 || command -v raxmlHPC')
+test -n "${RAXML_BIN}" || {
+  echo "ERROR: no non-AVX classic RAxML executable was found." >&2
+  exit 1
+}
+
+shopt -s nullglob
+alignments=(batches/batch_*.fasta)
+test "${#alignments[@]}" -gt 0 || {
+  echo "ERROR: no placement batches were found; run section 5.5 first." >&2
+  exit 1
+}
+
+for alignment in "${alignments[@]}"; do
+  batch_name=$(basename "$alignment" .fasta)
+  run_name="${batch_name}_AMFtree.ENVbackbone"
+  best_tree="RAxMLfiles/RAxML_bestTree.${run_name}"
+
+  if [[ -s "${best_tree}" ]]; then
+    echo "Skipping completed ${batch_name}"
+    continue
+  fi
+
+  rm -f \
+    "RAxMLfiles/RAxML_info.${run_name}" \
+    "RAxMLfiles/RAxML_log.${run_name}" \
+    "RAxMLfiles/RAxML_result.${run_name}" \
+    "RAxMLfiles/RAxML_parsimonyTree.${run_name}"
+
+  "${AMF_CONDA_EXE}" run --no-capture-output -n "${AMF_CONDA_ENV}" \
+    "${RAXML_BIN}" \
+    -f d \
+    -m GTRGAMMA \
+    -p 1723 \
+    -N 100 \
+    -r Root_V18_LSUDB_052025.newick \
+    -s "$alignment" \
+    -n "${run_name}" \
+    -T 8 \
+    -w "$(pwd)/RAxMLfiles"
+done
+```
+
+
+```{r archive-v18-clade-extraction, eval=FALSE}
+batch_files <- list.files(
+  file.path(phylo_dir, "batches"),
+  pattern = "^batch_[0-9]+\\.fasta$",
+  full.names = TRUE
+)
+expected_best_trees <- file.path(
+  phylo_dir,
+  "RAxMLfiles",
+  paste0(
+    "RAxML_bestTree.",
+    tools::file_path_sans_ext(basename(batch_files)),
+    "_AMFtree.ENVbackbone"
+  )
+)
+missing_best_trees <- expected_best_trees[!file.exists(expected_best_trees)]
+
+if (length(batch_files) == 0) {
+  cat("No placement batches found; complete sections 5.2–5.5 first.\n")
+} else if (length(missing_best_trees) > 0) {
+  cat(
+    length(batch_files) - length(missing_best_trees), "of", length(batch_files),
+    "expected RAxML best trees are present; finish section 5.6 before extraction.\n"
+  )
+} else {
+  old_wd <- setwd(phylo_dir)
+  tryCatch({
+    source("AMFcladesExtract.R", local = new.env(parent = globalenv()))
+    source("AMFcladeTaxonomy.R", local = new.env(parent = globalenv()))
+  }, finally = setwd(old_wd))
+  cat("V18 AMF clade extraction and taxonomy are complete.\n")
+}
+```
+
+## EUKARYOME classification on the cluster
+
+Save the following R chunk as `classify_LSU_EUKARYOME.R` on the cluster. The shell chunk replays the recorded resource allocation and filesystem bind. The original complete job script is unavailable locally. The reference is `DADA2_EUK_LSU_v2.1.fasta` from EUKARYOME LSU v2.1 (Tedersoo et al. 2024, https://doi.org/10.1093/database/baae043).
+
+```{r archive-eukaryome-cluster-script, eval=FALSE}
+library(dada2)
+base <- "/work/paramos/Amplicons/Rhizosphere/LSU/data/r64404e_20250325_141946/1_C03/analysis_output_corrected"
+reference <- "/work/databases/EUKARYOME_LSU_v2.1/DADA2/DADA2_EUK_LSU_v2.1.fasta"
+input <- file.path(base, "seqtab_nochim_sequences.rds")
+output <- file.path(base, "corrected_seqtab_reclassification")
+stopifnot(file.exists(input), file.exists(reference))
+counts <- readRDS(input)
+sequences <- colnames(counts)
+stopifnot(is.matrix(counts), !is.null(sequences), !anyDuplicated(sequences),
+          all(grepl("^[ACGTN]+$", sequences)))
+map <- data.frame(ASV_ID = paste0("ASV", seq_along(sequences)),
+                  Sequence = sequences, stringsAsFactors = FALSE)
+threads <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "16"))
+stopifnot(!is.na(threads), threads >= 1L)
+set.seed(1723)
+result <- assignTaxonomy(
+  seqs = sequences, refFasta = reference,
+  minBoot = 80, tryRC = TRUE, outputBootstraps = TRUE,
+  multithread = threads, verbose = TRUE
+)
+stopifnot(setequal(rownames(result$tax), map$Sequence),
+          setequal(rownames(result$boot), map$Sequence))
+taxonomy_values <- as.data.frame(result$tax[map$Sequence, , drop = FALSE])
+bootstrap_values <- as.data.frame(result$boot[map$Sequence, , drop = FALSE])
+rownames(taxonomy_values) <- rownames(bootstrap_values) <- NULL
+taxonomy <- cbind(map, taxonomy_values)
+bootstrap <- cbind(map, bootstrap_values)
+dir.create(output, recursive = TRUE, showWarnings = FALSE)
+write.table(taxonomy, file.path(output, "EUKARYOME_LSU_v2.1_taxonomy_ASV_ID.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+write.table(bootstrap, file.path(output, "EUKARYOME_LSU_v2.1_bootstraps_ASV_ID.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+write.csv(map, file.path(output, "LSU_ASV_ID_mapping.csv"), row.names = FALSE)
+saveRDS(result, file.path(output, "EUKARYOME_LSU_v2.1_assignment.rds"))
+```
+
+```{bash archive-eukaryome-cluster-launch, eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=LSU_EUKARYOME
+#SBATCH --account=one_sc_default
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --output=LSU_EUKARYOME_%j.out
+#SBATCH --error=LSU_EUKARYOME_%j.err
+set -euo pipefail
+GROUP="/storage/group/efc5279/default/DaniB"
+IMAGE="${GROUP}/containers/qiime2-amplicon-2025.10.sif"
+QIIME2_LIB="/opt/conda/envs/qiime2-amplicon-2025.10/lib"
+SCRIPT_HOST="${GROUP}/paramos/Amplicons/Rhizosphere/LSU/classify_LSU_EUKARYOME.R"
+apptainer exec --cleanenv \
+  --env "LD_LIBRARY_PATH=${QIIME2_LIB}:/.singularity.d/libs" \
+  --env "R_LIBS_USER=${QIIME2_LIB}/R/library" \
+  --env "R_LIBS=" --env "R_ENVIRON_USER=/dev/null" \
+  --env "R_PROFILE_USER=/dev/null" --env "PYTHONNOUSERSITE=1" \
+  --bind "${GROUP}:/work" "$IMAGE" \
+  Rscript "/work${SCRIPT_HOST#${GROUP}}"
+```
+# Reproducibility
+
+```{r session-record}
+writeLines(capture.output(sessionInfo()), file.path(paper_out, "sessionInfo.txt"))
+write.csv(manifest, file.path(paper_out, "input_manifest.csv"), row.names = FALSE)
+sessionInfo()
+```
+
